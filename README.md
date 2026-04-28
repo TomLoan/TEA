@@ -2,7 +2,7 @@
 
 A browser-based tool for early-stage techno-economic analysis of aerobic fermentation processes. Enter a product formula, fermentation targets, and cost inputs — get MSP, IRR, and a full OPEX/CAPEX breakdown in return.
 
-Based on the FEL-1 model from [Lynch et al. 2021](https://doi.org/10.1016/j.jclepro.2021.126274). Accuracy is ±50% — intended for R&D goal-setting, not detailed engineering.
+Based on the FEL-1 model from [Lynch et al. 2021](https://doi.org/10.1016/j.ymben.2021.03.004). Accuracy is ±50% — intended for R&D goal-setting, not detailed engineering.
 
 ---
 
