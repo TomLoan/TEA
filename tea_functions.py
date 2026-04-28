@@ -38,6 +38,38 @@ DSP_PRESETS = {
     'therapeutic_protein': {'yield': 0.50, 'opex_frac': 0.60, 'capex_frac': 0.50},
 }
 
+# ── Organism presets ─────────────────────────────────────────────────────────
+ORGANISM_PRESETS = {
+    'Generic (model default)': {
+        'biomass_yield_coeff': BIOMASS_YIELD_COEFF,   # ~0.504 gCDW/g glucose
+        'media_cost':          0.40,
+        'note': 'Battley 1987 empirical average (C₃.₈₅H₆.₆₉O₁.₇₈N). '
+                'Reasonable for E. coli, B. subtilis on glucose.',
+    },
+    'E. coli (aerobic)': {
+        'biomass_yield_coeff': 0.48,
+        'media_cost':          0.25,
+        'note': 'Simple mineral salts medium; aerobic growth on glucose.',
+    },
+    'S. cerevisiae (yeast)': {
+        'biomass_yield_coeff': 0.45,
+        'media_cost':          0.40,
+        'note': 'Aerobic; mineral medium. Lower yield than bacteria on glucose.',
+    },
+    'B. subtilis': {
+        'biomass_yield_coeff': 0.50,
+        'media_cost':          0.30,
+        'note': 'Aerobic; simple mineral medium. Similar to E. coli.',
+    },
+    'Mammalian (CHO-like)': {
+        'biomass_yield_coeff': 0.20,
+        'media_cost':          5.00,
+        'note': 'Very rough approximation only. Complex medium required; '
+                'high media cost. Model assumes aerobic single-substrate '
+                'fermentation — CHO bioreactors are substantially more complex.',
+    },
+}
+
 # ── Financial defaults (used as defaults in app.py) ──────────────────────────
 RAMP_FRACTIONS    = [0.50, 0.75, 1.00]
 CAPEX_YR1_FRAC    = 0.70
@@ -207,22 +239,29 @@ def run_chemistry(formula_str, is_protein=False,
 # SECTION 2 — FERMENTATION MODEL
 # ════════════════════════════════════════════════════════════════════════════════
 
-def run_fermentation_model(titer, rate, yield_fraction, chemistry):
+def run_fermentation_model(titer, rate, yield_fraction, chemistry,
+                            biomass_yield_coeff=None, biomass_o2_coeff=None):
     """
     Run the complete fermentation model.
 
     Parameters
     ----------
-    titer          : float  Final product concentration (g/L).
-    rate           : float  Average volumetric production rate (g/L/hr).
-    yield_fraction : float  Fraction of theoretical yield achieved (0–0.99).
-    chemistry      : dict   Output from run_chemistry().
+    titer               : float  Final product concentration (g/L).
+    rate                : float  Average volumetric production rate (g/L/hr).
+    yield_fraction      : float  Fraction of theoretical yield achieved (0–0.99).
+    chemistry           : dict   Output from run_chemistry().
+    biomass_yield_coeff : float  gCDW per g glucose. Defaults to BIOMASS_YIELD_COEFF
+                                 (~0.504). Use ORGANISM_PRESETS to get organism values.
+    biomass_o2_coeff    : float  g biomass per g O2. Defaults to BIOMASS_O2_COEFF.
 
     Returns
     -------
     dict with glucose partitioning, biomass, kinetics, oxygen, cooling, and
     time-course arrays (t_points, biomass_curve, product_curve).
     """
+    _biomass_yield = biomass_yield_coeff if biomass_yield_coeff is not None else BIOMASS_YIELD_COEFF
+    _biomass_o2    = biomass_o2_coeff    if biomass_o2_coeff    is not None else BIOMASS_O2_COEFF
+
     theoretical_yield = chemistry['theoretical_yield']
     eq                = chemistry['equation']
     txl_overhead      = chemistry.get('txl_glucose_g_per_g', 0.0)
@@ -233,7 +272,7 @@ def run_fermentation_model(titer, rate, yield_fraction, chemistry):
     total_sugar      = stoich_total + sugar_for_txl
     sugar_to_biomass = stoich_total - sugar_to_product
 
-    final_biomass    = sugar_to_biomass * BIOMASS_YIELD_COEFF
+    final_biomass    = sugar_to_biomass * _biomass_yield
     starting_biomass = INOCULUM_FRACTION * final_biomass
 
     ferm_time            = titer / rate
@@ -243,8 +282,7 @@ def run_fermentation_model(titer, rate, yield_fraction, chemistry):
     logistic_prod_rate   = product_to_cell_ratio * logistic_growth_rate
     specific_rate        = rate / final_biomass
 
-    O2_for_biomass = (final_biomass * (1.212 * MW_O2 / MW_BIOMASS)
-                      * (1000.0 / MW_O2))
+    O2_for_biomass = final_biomass / _biomass_o2 * (1000.0 / MW_O2)
 
     if eq['case'] == 3 and eq['O2'] > 1e-9:
         product_O2_yield_coeff = chemistry['yield_coeffs']['O2']
@@ -260,7 +298,7 @@ def run_fermentation_model(titer, rate, yield_fraction, chemistry):
 
     cumulative_O2 = O2_for_biomass + O2_for_product + O2_for_waste + O2_for_txl
 
-    max_OTR_biomass = ((1.0 / BIOMASS_O2_COEFF) * (1000.0 / MW_O2)
+    max_OTR_biomass = ((1.0 / _biomass_o2) * (1000.0 / MW_O2)
                        * (logistic_growth_rate / 4.0) * final_biomass)
 
     if eq['case'] == 3 and O2_for_product > 0:

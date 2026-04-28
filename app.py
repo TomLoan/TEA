@@ -13,7 +13,8 @@ from tea_functions import (
     run_chemistry, run_fermentation_model,
     calculate_plant_logistics, calculate_opex, size_equipment, calculate_capex,
     calculate_MSP, calculate_DCF,
-    DSP_PRESETS, RAMP_FRACTIONS, CAPEX_YR1_FRAC, CAPEX_YR2_FRAC,
+    DSP_PRESETS, ORGANISM_PRESETS,
+    RAMP_FRACTIONS, CAPEX_YR1_FRAC, CAPEX_YR2_FRAC,
     ONGOING_CAPEX_FRAC, DEPRECIATION_YR,
 )
 
@@ -59,6 +60,24 @@ with st.sidebar:
                                       help="DSP capital costs as fraction of total TCI. "
                                            "Small molecules: 0.20. Enzymes: 0.35. Therapeutics: 0.50.")
 
+    # Organism
+    st.subheader("Organism")
+    organism = st.selectbox("Organism preset", list(ORGANISM_PRESETS.keys()))
+    _org = ORGANISM_PRESETS[organism]
+    st.caption(_org['note'])
+    if organism == 'Mammalian (CHO-like)':
+        st.warning("CHO-like cells: this model is aerobic single-substrate only. "
+                   "Treat outputs as order-of-magnitude estimates.")
+    biomass_yield_override = st.number_input(
+        "Biomass yield (gCDW/g glucose)",
+        value=float(_org['biomass_yield_coeff']),
+        min_value=0.05, max_value=0.80, step=0.01,
+        help="Cell mass produced per gram of glucose consumed. "
+             "E. coli aerobic: ~0.48. Yeast: ~0.45. Mammalian: ~0.20. "
+             "Override the preset if you have measured data."
+    )
+    _preset_media_cost = _org['media_cost']
+
     # Fermentation
     st.subheader("Fermentation Performance")
     titer = st.number_input("Titer (g/L)", value=150.0, min_value=1.0, max_value=500.0)
@@ -82,9 +101,11 @@ with st.sidebar:
     price_mgso4_per_kg = st.number_input("MgSO4 ($/kg)", value=0.30, min_value=0.0, max_value=10.0,
                                           help="Industrial-grade magnesium sulfate (sulfur source). "
                                                "Only relevant for S-containing products.")
-    media_cost_per_kgCDW = st.number_input("Media cost ($/kgCDW)", value=0.40, min_value=0.0, max_value=10.0,
+    media_cost_per_kgCDW = st.number_input("Media cost ($/kgCDW)", value=_preset_media_cost,
+                                            min_value=0.0, max_value=50.0,
                                             help="Mineral salts media. Default $0.40/kgCDW (Lynch 2021). "
-                                                 "Typical range: $0.30–$0.80/kgCDW.")
+                                                 "Typical range: $0.30–$0.80/kgCDW for bacteria; "
+                                                 "$5+/kgCDW for mammalian cells.")
     price_NaOH_per_kg = st.number_input("NaOH ($/kg)", value=0.15, min_value=0.01, max_value=5.0)
     price_peracetic_per_L = st.number_input("Peracetic acid ($/L)", value=5.00, min_value=0.1, max_value=50.0)
 
@@ -139,11 +160,22 @@ try:
         st.warning("S detected in formula but Product type is 'Small Molecule'. "
                    "Consider switching to Industrial Enzyme or Therapeutic Protein.")
 
-    ferm = run_fermentation_model(titer, rate, yield_fraction, chem)
+    ferm = run_fermentation_model(titer, rate, yield_fraction, chem,
+                                   biomass_yield_coeff=biomass_yield_override)
     logistics = calculate_plant_logistics(
         capacity_kta, annual_uptime, batches_on_spec,
         tank_volume_L, turnaround_time, ferm
     )
+
+    if rate >= titer:
+        st.warning(f"Rate ({rate} g/L/hr) ≥ titer ({titer} g/L): fermentation time is "
+                   f"{ferm['ferm_time']:.1f} hr — likely unrealistic.")
+    if logistics['n_tanks'] > 30:
+        st.warning(f"{logistics['n_tanks']} tanks required. Consider increasing titer, "
+                   f"tank volume, or reducing capacity target.")
+    if CEPCI < 700:
+        st.info(f"CEPCI = {CEPCI} (2020 baseline). Current value (2024) ≈ 800. "
+                "Equipment cost estimates may be understated by ~30%.")
 
     # Two-pass OPEX (first pass without other_fixed to get CAPEX, then re-run)
     opex_pass1 = calculate_opex(logistics, ferm, chem,
@@ -184,12 +216,39 @@ if error_msg:
     st.error(f"Calculation error: {error_msg}")
     st.stop()
 
+if MSP == float('inf'):
+    st.error("MSP is undefined: (1 − tax rate) − target margin ≤ 0. "
+             "Reduce target margin or tax rate.")
+    st.stop()
+
 # Headline metrics
 mcol1, mcol2, mcol3, mcol4 = st.columns(4)
 mcol1.metric("MSP", f"${MSP:.2f}/kg")
 mcol2.metric("IRR", f"{dcf['IRR']:.1f}%")
 mcol3.metric("NPV (20-yr)", f"${dcf['NPV']/1e6:.1f}M")
 mcol4.metric("TCI (total)", f"${capex['TCI_total']/1e6:.0f}M")
+
+with st.expander("Model scope & assumptions"):
+    st.markdown("""
+**Applicable to:** Aerobic batch/fed-batch fermentation, glucose as sole carbon source,
+products containing C/H/O/N/S atoms, scale ~1–100 kta. **Accuracy: ±50% (FEL-1 level).**
+
+**Not modelled:** Anaerobic fermentation · Alternative feedstocks (xylose, methanol, etc.) ·
+Stationary-phase production · GMP/regulatory costs · Multi-substrate media · Fed-batch feeding strategies.
+
+| Hard-coded assumption | Value | Source |
+|---|---|---|
+| Seed train cost | 27% of main fermentation area | Lynch 2021 |
+| Labour | 2.5 FTE/tank × $60k loaded × 1.5× overhead | Lynch 2021 |
+| DO setpoint | 25% of air saturation | Typical aerobic |
+| Tank working volume | 85% of total volume | Engineering rule of thumb |
+| Depreciation | 10-yr straight-line | Lynch 2021 |
+| Ongoing maintenance capex | 10% TCI/yr | Lynch 2021 |
+| Ramp-up schedule | 50% → 75% → 100% over 3 years | Lynch 2021 |
+| Inoculum | 1% of final biomass | Typical practice |
+
+*Reference: Lynch et al. 2021, J. Cleaner Production*
+""")
 
 st.divider()
 
