@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3)",
+      "Bash(python)",
+      "Bash(PYTHONIOENCODING=utf-8 python)",
+      "Bash(python -c ' *)",
+      "Bash(python patch_stage3.py)",
+      "Bash(python patch_stage4.py)",
+      "Bash(python patch_stage5.py)",
+      "Bash(python patch_verify.py)"
+    ]
+  }
+}
