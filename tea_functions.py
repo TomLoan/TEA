@@ -1,6 +1,39 @@
 """
-tea_functions.py — Pure functions extracted from bioprocess_tea_calculator.ipynb
-All functions are side-effect-free; no print/plot calls except inside verbose guards.
+tea_functions.py — Bioprocess TEA calculation functions.
+
+Implements the model described in:
+  Lynch, S.A. (2021). The bioprocess TEA calculator.
+  Metabolic Engineering, 65, 42–51.
+
+All functions are pure (no print/plot side-effects except inside verbose= guards).
+
+SCOPE
+-----
+- Aerobic batch/fed-batch fermentation on glucose as the sole carbon source
+- Products containing C, H, O, N, S atoms
+- New plant construction at 1–100 kta production scale
+- Accuracy: ±50% (FEL-1 / order-of-magnitude estimate)
+- Intended for early-stage R&D goal-setting, not detailed engineering
+
+NOT APPLICABLE TO
+-----------------
+- Anaerobic fermentation
+- Alternative carbon sources (xylose, methanol, glycerol, …)
+- Stationary-phase or non-growth-associated production
+- GMP / pharmaceutical-grade facilities (regulatory costs not modelled)
+- Mammalian cell culture beyond rough approximation
+
+KNOWN DISCREPANCIES vs LYNCH 2021 (all within ±50% FEL-1 tolerance)
+---------------------------------------------------------------------
+- MaxOTR: equations in the supplementary give a value ~14× lower than Fig. 5b
+  (176.18 mmol/L/hr). Cannot be resolved from published equations alone —
+  likely reflects undescribed terms in the original JavaScript tool.
+  CUMULATIVE O₂ (which drives annual air and cooling costs) is unaffected.
+- OPEX: ~$1.32/kg vs paper $1.46/kg — gap from labour formula approximation
+  and capital-linked fixed costs (Davis 2018 formula not fully published).
+- CAPEX: ~$2.67/kg vs paper $2.76/kg — within 4%.
+- IRR: ~10 percentage points higher throughout — consistent with slightly
+  lower cost base; relative sensitivity to inputs is preserved.
 """
 import re
 import math
@@ -31,42 +64,196 @@ ASPECT_RATIO        = 3.0     # fermenter height:diameter ratio
 O2_MOLES_PER_M3_AIR = 9.375  # mol O2 / m³ air at STP
 DO_UTILISATION      = 0.75    # fraction of O2 in sparged air that is consumed
 
-# ── DSP presets ───────────────────────────────────────────────────────────────
-DSP_PRESETS = {
-    'small_molecule':      {'yield': 0.90, 'opex_frac': 0.20, 'capex_frac': 0.20},
-    'industrial_enzyme':   {'yield': 0.70, 'opex_frac': 0.30, 'capex_frac': 0.35},
-    'therapeutic_protein': {'yield': 0.50, 'opex_frac': 0.60, 'capex_frac': 0.50},
+# ── DSP route library ─────────────────────────────────────────────────────────
+# Each route defines per-step yield fractions and cost correlations.
+# CAPEX scales with annual broth throughput via power law (6th-tenths rule).
+# OPEX = DSP_CAPEX × opex_pct_capex (covers utilities, consumables, labour).
+# Reference costs are order-of-magnitude estimates consistent with ±50% FEL-1.
+DSP_ROUTE_LIBRARY = {
+    'minimal_processing': {
+        'label': 'Minimal processing — cell separation only (food proteins, SCP, whole-cell products)',
+        'steps': [
+            ('Centrifugation / microfiltration', 0.97),
+            ('Concentration / spray drying',     0.97),
+        ],
+        'capex_ref':      2_000_000,   # $ at ref_vol_m3_yr broth throughput
+        'ref_vol_m3_yr':  10_000,
+        'scale_exp':      0.60,
+        'opex_pct_capex': 0.30,
+    },
+    'crystallisation': {
+        'label': 'Crystallisation (organic acids, amino acids)',
+        'steps': [
+            ('Broth centrifugation',          0.98),
+            ('Acidification / precipitation', 0.93),
+            ('Washing filtration',            0.96),
+            ('Drying',                        0.98),
+        ],
+        'capex_ref':      8_000_000,
+        'ref_vol_m3_yr':  10_000,
+        'scale_exp':      0.65,
+        'opex_pct_capex': 0.35,
+    },
+    'solvent_extraction': {
+        'label': 'Solvent extraction (terpenoids, fatty alcohols, hydrophobic small molecules)',
+        'steps': [
+            ('Broth centrifugation',     0.97),
+            ('Liquid-liquid extraction', 0.88),
+            ('Solvent stripping',        0.94),
+            ('Polish / adsorption',      0.96),
+        ],
+        'capex_ref':      12_000_000,
+        'ref_vol_m3_yr':  10_000,
+        'scale_exp':      0.65,
+        'opex_pct_capex': 0.45,
+    },
+    'uf_precipitation': {
+        'label': 'UF + precipitation (secreted enzymes, extracellular proteins)',
+        'steps': [
+            ('Broth centrifugation',            0.93),
+            ('Ultrafiltration / concentration', 0.90),
+            ('Precipitation',                   0.82),
+            ('Drying / formulation',            0.95),
+        ],
+        'capex_ref':      15_000_000,
+        'ref_vol_m3_yr':  10_000,
+        'scale_exp':      0.70,
+        'opex_pct_capex': 0.50,
+    },
+    'chromatography': {
+        'label': 'Capture + polish chromatography (recombinant proteins, high-value enzymes)',
+        'steps': [
+            ('Broth centrifugation',   0.93),
+            ('Capture chromatography', 0.85),
+            ('Polish chromatography',  0.90),
+            ('UF/DF + formulation',    0.93),
+        ],
+        'capex_ref':      20_000_000,
+        'ref_vol_m3_yr':  10_000,
+        'scale_exp':      0.70,
+        'opex_pct_capex': 0.60,
+    },
+    'multi_column_chromatography': {
+        'label': 'Multi-step chromatography (therapeutic proteins, mAbs)',
+        'steps': [
+            ('Centrifugation / clarification', 0.88),
+            ('Protein A / capture',            0.87),
+            ('Ion exchange polish',            0.92),
+            ('UF/DF + formulation',            0.95),
+        ],
+        'capex_ref':      40_000_000,
+        'ref_vol_m3_yr':  10_000,
+        'scale_exp':      0.75,
+        'opex_pct_capex': 0.75,
+    },
 }
+
+
+def calculate_dsp(route_name, annual_broth_vol_m3, step_yield_overrides=None):
+    """
+    Calculate DSP yield, CAPEX, and OPEX for a given processing route.
+
+    Parameters
+    ----------
+    route_name : str
+        Key in DSP_ROUTE_LIBRARY.
+    annual_broth_vol_m3 : float
+        Annual broth volume processed (m³/yr) — logistics['annual_ferm_vol'] / 1000.
+    step_yield_overrides : list of float or None
+        Per-step yield fractions (same length as route steps). None = use defaults.
+
+    Returns
+    -------
+    dict with keys: step_names, step_yields, overall_yield, dsp_capex, dsp_opex, route_label.
+    """
+    route = DSP_ROUTE_LIBRARY[route_name]
+    steps = route['steps']
+
+    step_yields = (list(step_yield_overrides)
+                   if step_yield_overrides is not None
+                   else [y for _, y in steps])
+
+    overall_yield = 1.0
+    for y in step_yields:
+        overall_yield *= y
+
+    dsp_capex = (route['capex_ref']
+                 * (annual_broth_vol_m3 / route['ref_vol_m3_yr']) ** route['scale_exp'])
+    dsp_opex  = dsp_capex * route['opex_pct_capex']
+
+    return {
+        'step_names':    [name for name, _ in steps],
+        'step_yields':   step_yields,
+        'overall_yield': overall_yield,
+        'dsp_capex':     dsp_capex,
+        'dsp_opex':      dsp_opex,
+        'route_label':   route['label'],
+    }
 
 # ── Organism presets ─────────────────────────────────────────────────────────
 ORGANISM_PRESETS = {
     'Generic (model default)': {
-        'biomass_yield_coeff': BIOMASS_YIELD_COEFF,   # ~0.504 gCDW/g glucose
-        'media_cost':          0.40,
+        'biomass_yield_coeff':  BIOMASS_YIELD_COEFF,   # ~0.504 gCDW/g glucose
+        'carbon_to_co2_frac':   0.0,
+        'media_cost':           0.40,
         'note': 'Battley 1987 empirical average (C₃.₈₅H₆.₆₉O₁.₇₈N). '
                 'Reasonable for E. coli, B. subtilis on glucose.',
     },
     'E. coli (aerobic)': {
-        'biomass_yield_coeff': 0.48,
-        'media_cost':          0.25,
-        'note': 'Simple mineral salts medium; aerobic growth on glucose.',
+        'biomass_yield_coeff':  0.48,
+        'carbon_to_co2_frac':   0.20,   # acetate overflow at high mu
+        'media_cost':           0.25,
+        'note': 'Simple mineral salts medium; aerobic growth on glucose. '
+                '~20% of non-product glucose lost to acetate overflow even aerobically.',
     },
     'S. cerevisiae (yeast)': {
-        'biomass_yield_coeff': 0.45,
-        'media_cost':          0.40,
-        'note': 'Aerobic; mineral medium. Lower yield than bacteria on glucose.',
+        'biomass_yield_coeff':  0.45,
+        'carbon_to_co2_frac':   0.35,   # Crabtree effect — ethanol above ~0.1 g/L/hr glucose
+        'media_cost':           0.40,
+        'note': 'Aerobic; mineral medium. Crabtree effect produces ethanol '
+                'above ~0.1 g/L/hr glucose — ~35% of non-product glucose diverted to CO₂/ethanol.',
+    },
+    'Pichia pastoris (methanol)': {
+        'biomass_yield_coeff':  0.35,   # gCDW/g methanol (literature: 0.3–0.5)
+        'carbon_to_co2_frac':   0.05,   # Crabtree-negative; minimal overflow on methanol
+        'media_cost':           0.50,   # $/kgCDW — trace salts, biotin, more complex than E. coli
+        'note': 'Methylotrophic yeast widely used for secreted recombinant proteins. '
+                'Crabtree-negative (no ethanol overflow on methanol). '
+                'Select "Methanol" as carbon source to use methanol feedstock pricing. '
+                'Stoichiometry uses a glucose-equivalent approximation (carbon content per gram '
+                'differs by <7%) — suitable for FEL-1 (±50%) estimates. '
+                'Typical: 1–20 g/L secreted protein; 0.05–0.5 g/L/hr productivity.',
     },
     'B. subtilis': {
-        'biomass_yield_coeff': 0.50,
-        'media_cost':          0.30,
-        'note': 'Aerobic; simple mineral medium. Similar to E. coli.',
+        'biomass_yield_coeff':  0.50,
+        'carbon_to_co2_frac':   0.10,   # minor acetoin/acetate overflow
+        'media_cost':           0.30,
+        'note': 'Aerobic; simple mineral medium. Relatively efficient — '
+                'minor acetoin/acetate overflow (~10% of non-product glucose).',
     },
     'Mammalian (CHO-like)': {
-        'biomass_yield_coeff': 0.20,
-        'media_cost':          5.00,
+        'biomass_yield_coeff':  0.20,
+        'carbon_to_co2_frac':   0.50,   # Warburg-like lactate + high ATP maintenance
+        'media_cost':           5.00,
         'note': 'Very rough approximation only. Complex medium required; '
-                'high media cost. Model assumes aerobic single-substrate '
-                'fermentation — CHO bioreactors are substantially more complex.',
+                'high media cost. Warburg-like lactate production + high maintenance '
+                'energy (~50% of non-product glucose to CO₂/lactate). '
+                'Model assumes aerobic single-substrate fermentation — CHO bioreactors are substantially more complex.',
+    },
+}
+
+CARBON_SOURCE_OPTIONS = {
+    'Glucose': {
+        'label':       'Glucose price ($/kg)',
+        'default_per_kg': 0.40,
+        'note':    'Dextrose (corn syrup). Industrial bulk price ~$0.33–0.55/kg.',
+    },
+    'Methanol': {
+        'label':       'Methanol price ($/kg)',
+        'default_per_kg': 0.31,   # ~$0.25–0.40/kg industrial bulk methanol
+        'note':    'Industrial-grade methanol. Price ~$0.25–0.40/kg; highly region-dependent. '
+                   'Stoichiometry uses a glucose-equivalent basis (carbon content per gram '
+                   'differs by <7% between glucose and methanol — within FEL-1 tolerance).',
     },
 }
 
@@ -79,8 +266,21 @@ DEPRECIATION_YR   = 10
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — CHEMISTRY
+# SECTION 1 — CHEMISTRY & STOICHIOMETRY
 # ════════════════════════════════════════════════════════════════════════════════
+#
+# The key insight (Lynch 2021 §1) is to express both glucose and any organic
+# product as combinations of two building blocks: CO₂ (carbon) and H₂
+# (reducing equivalents). Glucose has an H₂:CO₂ ratio of exactly 2.
+#
+#   ratio > 2 → product MORE REDUCED than glucose: biology must conserve
+#               reducing power, so some carbon is lost as CO₂ (Case 2).
+#   ratio = 2 → NEUTRAL: no byproduct carbon or O₂ needed (Case 1).
+#   ratio < 2 → product MORE OXIDISED than glucose: O₂ consumed as reactant
+#               (Case 3).
+#
+# This classification determines the balanced stoichiometric equation and
+# therefore the theoretical maximum yield.
 
 def parse_formula(formula_str):
     """Parse a molecular formula string into atom counts {C, H, O, N, S}."""
@@ -109,6 +309,12 @@ def calculate_molecular_weight(a, b, c, d, e=0):
             ATOMIC_WEIGHTS['S'] * e)
 
 
+# H₂:CO₂ ratio for CₐHᵦOᵧNδSε (Equation 3, Lynch 2021):
+#   ratio = 0.5(b/a) − 1.0(c/a) − 1.5(d/a) + 3.0(e/a) + 2.0
+# The +3(e/a) S term is an extension of the original: SO₄²⁻ (S at +6) is
+# reduced to organic S (S at −2), consuming 8 electrons per atom, but the
+# net coefficient is +3 after accounting for the O and H that H₂SO₄ itself
+# contributes to the atom balance (not +4 as a naive electron count suggests).
 def calculate_h2_co2_ratio(a, b, c, d, e=0):
     """
     H2:CO2 ratio for product CaHbOcNdSe.
@@ -121,6 +327,14 @@ def calculate_h2_co2_ratio(a, b, c, d, e=0):
     return 0.5*(b/a) - 1.0*(c/a) - 1.5*(d/a) + 3.0*(e/a) + 2.0
 
 
+# Balanced equations per mole of glucose (Supplemental Materials §1, Lynch 2021):
+#   Case 1 (ratio = 2, neutral):
+#     glucose + W NH₃ + V H₂SO₄  →  X product + Z H₂O
+#   Case 2 (ratio > 2, more reduced):
+#     glucose + W NH₃ + V H₂SO₄  →  X product + Z H₂O + Q CO₂
+#   Case 3 (ratio < 2, more oxidised):
+#     glucose + W NH₃ + V H₂SO₄ + Y O₂  →  X product + Z H₂O
+# H₂SO₄ is used as the stoichiometric S source (gives same atom balance as MgSO₄).
 def balance_equation(a, b, c, d, e=0):
     """
     Balance the stoichiometric equation for glucose -> product (per 1 mol glucose).
@@ -162,6 +376,10 @@ def balance_equation(a, b, c, d, e=0):
                 'NH3': W, 'H2SO4': V, 'O2': O2, 'product': Y, 'H2O': Z, 'CO2': 0.0}
 
 
+# Theoretical yield (g product / g glucose):
+#   Y = (moles_product × MW_product) / MW_glucose
+# This is the stoichiometric ceiling. The actual yield achieved in the
+# fermentation is yield_fraction × Y (yield_fraction is a user input).
 def calculate_theoretical_yield(a, b, c, d, e=0):
     """Theoretical max yield in g product per g glucose."""
     MW_product = calculate_molecular_weight(a, b, c, d, e)
@@ -238,21 +456,64 @@ def run_chemistry(formula_str, is_protein=False,
 # ════════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — FERMENTATION MODEL
 # ════════════════════════════════════════════════════════════════════════════════
+#
+# Models a single aerobic batch/fed-batch fermentation.
+# Key assumptions (Supplemental Materials §2, Lynch 2021):
+#
+#   Growth-associated production: product accumulates as cells grow.
+#
+#   Logistic growth: N(t) = K / (1 + A·exp(−r·t))
+#     K  = final biomass (gCDW/L, the "carrying capacity")
+#     A  = (K − N₀) / N₀   (shape parameter from initial conditions)
+#     r  = logistic growth rate (hr⁻¹), solved so culture reaches K in ferm_time
+#     N₀ = 1% of K (inoculum from seed culture)
+#     Peak growth rate occurs at N = K/2, used to estimate maximum OTR.
+#
+#   Glucose partitioning:
+#     sugar_to_product = titer / theoretical_yield
+#     stoich_total     = sugar_to_product / yield_fraction   (includes losses)
+#     sugar_to_biomass = stoich_total − sugar_to_product
+#     Biomass grows at 80% of the theoretical conversion (Eq. S2.8):
+#       0.84 glucose + NH₃ + 1.212 O₂ → 1 biomass + 3.212 H₂O + 1.212 CO₂
+#     Biomass empirical formula: C₃.₈₅H₆.₆₉O₁.₇₈N (Battley 1987), MW = 95.37 g/mol
+#
+#   NOTE — MaxOTR discrepancy: the published supplementary equations give a
+#   MaxOTR ~14× lower than Fig. 5b (176.18 mmol/L/hr). This cannot be resolved
+#   from the paper alone and likely reflects undescribed terms in the original
+#   JavaScript. CUMULATIVE O₂ (which drives annual air and cooling costs) is
+#   unaffected and matches the paper's cost outputs.
+#
+#   Heat generation: 0.460 kJ per mmol O₂ consumed (Doran 1995). (Eq. S3.22)
 
 def run_fermentation_model(titer, rate, yield_fraction, chemistry,
-                            biomass_yield_coeff=None, biomass_o2_coeff=None):
+                            biomass_yield_coeff=None, biomass_o2_coeff=None,
+                            carbon_to_co2_frac=0.0,
+                            production_mode='growth_associated',
+                            target_biomass=None, growth_time_hr=None):
     """
     Run the complete fermentation model.
 
     Parameters
     ----------
     titer               : float  Final product concentration (g/L).
-    rate                : float  Average volumetric production rate (g/L/hr).
+    rate                : float  Volumetric production rate (g/L/hr). In
+                                 growth_associated mode: average over the batch.
+                                 In stationary_phase mode: rate during the production
+                                 phase only.
     yield_fraction      : float  Fraction of theoretical yield achieved (0–0.99).
     chemistry           : dict   Output from run_chemistry().
-    biomass_yield_coeff : float  gCDW per g glucose. Defaults to BIOMASS_YIELD_COEFF
-                                 (~0.504). Use ORGANISM_PRESETS to get organism values.
+    biomass_yield_coeff : float  gCDW per g glucose. Defaults to BIOMASS_YIELD_COEFF.
     biomass_o2_coeff    : float  g biomass per g O2. Defaults to BIOMASS_O2_COEFF.
+    carbon_to_co2_frac  : float  Fraction of non-product glucose (growth_associated) or
+                                 growth-phase glucose (stationary_phase) diverted to
+                                 CO₂/heat via overflow or maintenance. Default 0.0.
+    production_mode     : str    'growth_associated' (default, Lynch 2021) or
+                                 'stationary_phase' (grow to target_biomass, then
+                                 produce at given rate for titer/rate hours).
+    target_biomass      : float  Target biomass at induction (gCDW/L). Required for
+                                 stationary_phase mode.
+    growth_time_hr      : float  Duration of growth phase (hr). Required for
+                                 stationary_phase mode.
 
     Returns
     -------
@@ -261,29 +522,24 @@ def run_fermentation_model(titer, rate, yield_fraction, chemistry,
     """
     _biomass_yield = biomass_yield_coeff if biomass_yield_coeff is not None else BIOMASS_YIELD_COEFF
     _biomass_o2    = biomass_o2_coeff    if biomass_o2_coeff    is not None else BIOMASS_O2_COEFF
+    _co2_frac      = max(0.0, min(0.99, carbon_to_co2_frac))
+
+    if production_mode == 'stationary_phase':
+        if not target_biomass or target_biomass <= 0:
+            raise ValueError("target_biomass must be > 0 for stationary_phase mode.")
+        if not growth_time_hr or growth_time_hr <= 0:
+            raise ValueError("growth_time_hr must be > 0 for stationary_phase mode.")
 
     theoretical_yield = chemistry['theoretical_yield']
     eq                = chemistry['equation']
     txl_overhead      = chemistry.get('txl_glucose_g_per_g', 0.0)
 
+    # Shared: product glucose budget (same semantics in both modes)
     sugar_to_product = titer / theoretical_yield
     stoich_total     = sugar_to_product / yield_fraction
     sugar_for_txl    = titer * txl_overhead
-    total_sugar      = stoich_total + sugar_for_txl
-    sugar_to_biomass = stoich_total - sugar_to_product
 
-    final_biomass    = sugar_to_biomass * _biomass_yield
-    starting_biomass = INOCULUM_FRACTION * final_biomass
-
-    ferm_time            = titer / rate
-    A                    = (final_biomass - starting_biomass) / starting_biomass
-    logistic_growth_rate = -math.log(0.01 / A) / ferm_time
-    product_to_cell_ratio = titer / (final_biomass - starting_biomass)
-    logistic_prod_rate   = product_to_cell_ratio * logistic_growth_rate
-    specific_rate        = rate / final_biomass
-
-    O2_for_biomass = final_biomass / _biomass_o2 * (1000.0 / MW_O2)
-
+    # O2 for product formation (Case 3 only) — shared
     if eq['case'] == 3 and eq['O2'] > 1e-9:
         product_O2_yield_coeff = chemistry['yield_coeffs']['O2']
         O2_for_product = (titer / product_O2_yield_coeff) * (1000.0 / MW_O2)
@@ -291,70 +547,172 @@ def run_fermentation_model(titer, rate, yield_fraction, chemistry,
         O2_for_product = 0.0
 
     theoretical_biomass_yield_100pct = MW_BIOMASS / (0.84 * MW_GLUCOSE)
-    glucose_at_100pct = final_biomass / theoretical_biomass_yield_100pct
-    waste_glucose     = sugar_to_biomass - glucose_at_100pct
-    O2_for_waste      = waste_glucose * (6.0 * MW_O2 / MW_GLUCOSE) * (1000.0 / MW_O2)
-    O2_for_txl        = sugar_for_txl * (6.0 * MW_O2 / MW_GLUCOSE) * (1000.0 / MW_O2)
 
-    cumulative_O2 = O2_for_biomass + O2_for_product + O2_for_waste + O2_for_txl
+    if production_mode == 'stationary_phase':
+        # ── Stationary-phase path ─────────────────────────────────────────────
+        # Grow to target_biomass in growth_time_hr, then produce for titer/rate hr.
+        t_production     = titer / rate
+        ferm_time        = growth_time_hr + t_production
 
-    max_OTR_biomass = ((1.0 / _biomass_o2) * (1000.0 / MW_O2)
-                       * (logistic_growth_rate / 4.0) * final_biomass)
+        final_biomass    = target_biomass
+        starting_biomass = INOCULUM_FRACTION * target_biomass
 
-    if eq['case'] == 3 and O2_for_product > 0:
-        max_product_rate = (product_to_cell_ratio * logistic_growth_rate
-                            * final_biomass / 4.0)
-        max_OTR_product  = ((1.0 / chemistry['yield_coeffs']['O2'])
-                            * (1000.0 / MW_O2) * max_product_rate)
+        # Growth-phase glucose: work backwards from target_biomass.
+        # carbon_to_co2_frac represents overflow/maintenance during the growth phase.
+        glucose_to_biomass   = target_biomass / _biomass_yield
+        total_growth_glucose = glucose_to_biomass / (1.0 - _co2_frac)
+        glucose_to_co2       = total_growth_glucose - glucose_to_biomass
+        sugar_to_biomass     = total_growth_glucose
+        total_sugar          = stoich_total + sugar_for_txl + total_growth_glucose
+
+        # Kinetics — logistic rate solved for the growth phase duration
+        A                    = (target_biomass - starting_biomass) / starting_biomass
+        logistic_growth_rate = -math.log(0.01 / A) / growth_time_hr
+        product_to_cell_ratio = None   # not meaningful: production is decoupled from growth
+        logistic_prod_rate    = None
+        specific_rate         = rate / target_biomass
+
+        # O2
+        O2_for_biomass    = target_biomass / _biomass_o2 * (1000.0 / MW_O2)
+        glucose_at_100pct = target_biomass / theoretical_biomass_yield_100pct
+        waste_glucose     = glucose_to_biomass - glucose_at_100pct
+        O2_for_waste      = waste_glucose    * 6000.0 / MW_GLUCOSE
+        O2_for_overflow   = glucose_to_co2   * 6000.0 / MW_GLUCOSE
+        O2_for_txl        = sugar_for_txl    * 6000.0 / MW_GLUCOSE
+        cumulative_O2     = O2_for_biomass + O2_for_product + O2_for_waste + O2_for_overflow + O2_for_txl
+
+        # max_OTR: growth phase peaks at N=K/2; stationary OTR from product formation (Case 3)
+        max_OTR_biomass    = ((1.0 / _biomass_o2) * (1000.0 / MW_O2)
+                               * (logistic_growth_rate / 4.0) * target_biomass)
+        if eq['case'] == 3 and O2_for_product > 0:
+            max_OTR_stationary = (rate / chemistry['yield_coeffs']['O2']) * (1000.0 / MW_O2)
+        else:
+            max_OTR_stationary = 0.0
+        max_OTR = max(max_OTR_biomass, max_OTR_stationary)
+
+        # Time-course: two concatenated phases proportional to their durations
+        n_growth = max(2, int(150 * growth_time_hr / ferm_time))
+        n_prod   = 300 - n_growth
+        t_g = np.linspace(0, growth_time_hr, n_growth)
+        t_p = np.linspace(growth_time_hr, ferm_time, n_prod)
+        biomass_curve = np.concatenate([
+            target_biomass / (1.0 + A * np.exp(-logistic_growth_rate * t_g)),
+            np.full(n_prod, target_biomass),
+        ])
+        product_curve = np.concatenate([np.zeros(n_growth), rate * (t_p - growth_time_hr)])
+        t_points = np.concatenate([t_g, t_p])
+
     else:
-        max_OTR_product = 0.0
+        # ── Growth-associated path (original Lynch 2021) ─────────────────────
+        total_sugar      = stoich_total + sugar_for_txl
+        sugar_to_biomass = stoich_total - sugar_to_product
 
-    max_OTR         = max_OTR_biomass + max_OTR_product
-    max_O2_gradient = O2_SATURATION * (1.0 - DO_SETPOINT)
-    max_kla         = (max_OTR / max_O2_gradient) / 3600.0
+        # Split non-product glucose: fraction to biomass vs overflow/maintenance
+        glucose_to_biomass = sugar_to_biomass * (1.0 - _co2_frac)
+        glucose_to_co2     = sugar_to_biomass * _co2_frac
 
+        final_biomass    = glucose_to_biomass * _biomass_yield
+        starting_biomass = INOCULUM_FRACTION * final_biomass
+
+        ferm_time             = titer / rate
+        A                     = (final_biomass - starting_biomass) / starting_biomass
+        logistic_growth_rate  = -math.log(0.01 / A) / ferm_time
+        product_to_cell_ratio = titer / (final_biomass - starting_biomass)
+        logistic_prod_rate    = product_to_cell_ratio * logistic_growth_rate
+        specific_rate         = rate / final_biomass
+
+        O2_for_biomass    = final_biomass / _biomass_o2 * (1000.0 / MW_O2)
+        glucose_at_100pct = final_biomass / theoretical_biomass_yield_100pct
+        waste_glucose     = glucose_to_biomass - glucose_at_100pct
+        O2_for_waste      = waste_glucose    * 6000.0 / MW_GLUCOSE
+        O2_for_overflow   = glucose_to_co2   * 6000.0 / MW_GLUCOSE
+        O2_for_txl        = sugar_for_txl    * 6000.0 / MW_GLUCOSE
+        cumulative_O2     = O2_for_biomass + O2_for_product + O2_for_waste + O2_for_overflow + O2_for_txl
+
+        max_OTR_biomass = ((1.0 / _biomass_o2) * (1000.0 / MW_O2)
+                           * (logistic_growth_rate / 4.0) * final_biomass)
+        if eq['case'] == 3 and O2_for_product > 0:
+            max_product_rate = (product_to_cell_ratio * logistic_growth_rate
+                                * final_biomass / 4.0)
+            max_OTR_product  = ((1.0 / chemistry['yield_coeffs']['O2'])
+                                * (1000.0 / MW_O2) * max_product_rate)
+        else:
+            max_OTR_product = 0.0
+        max_OTR = max_OTR_biomass + max_OTR_product
+
+        t_points      = np.linspace(0, ferm_time, 300)
+        biomass_curve = final_biomass / (1.0 + A * np.exp(-logistic_growth_rate * t_points))
+        product_curve = product_to_cell_ratio * (biomass_curve - starting_biomass)
+
+    # Shared post-processing
+    max_O2_gradient  = O2_SATURATION * (1.0 - DO_SETPOINT)
+    max_kla          = (max_OTR / max_O2_gradient) / 3600.0
     max_cooling_rate = O2_COOLING_COEFF * max_OTR
     ave_cooling_rate = O2_COOLING_COEFF * (cumulative_O2 / ferm_time)
 
-    t_points      = np.linspace(0, ferm_time, 300)
-    K             = final_biomass
-    biomass_curve = K / (1.0 + A * np.exp(-logistic_growth_rate * t_points))
-    product_curve = product_to_cell_ratio * (biomass_curve - starting_biomass)
-
     return {
         'titer': titer, 'rate': rate, 'yield_fraction': yield_fraction,
-        'theoretical_yield': theoretical_yield,
-        'sugar_to_product': sugar_to_product,
-        'total_sugar': total_sugar,
-        'sugar_to_biomass': sugar_to_biomass,
-        'final_biomass': final_biomass,
-        'starting_biomass': starting_biomass,
-        'ferm_time': ferm_time,
-        'A': A,
+        'theoretical_yield':    theoretical_yield,
+        'sugar_to_product':     sugar_to_product,
+        'stoich_total':         stoich_total,
+        'total_sugar':          total_sugar,
+        'sugar_to_biomass':     sugar_to_biomass,
+        'glucose_to_biomass':   glucose_to_biomass,
+        'glucose_to_co2':       glucose_to_co2,
+        'final_biomass':        final_biomass,
+        'starting_biomass':     starting_biomass,
+        'ferm_time':            ferm_time,
+        'A':                    A,
         'logistic_growth_rate': logistic_growth_rate,
         'product_to_cell_ratio': product_to_cell_ratio,
-        'logistic_prod_rate': logistic_prod_rate,
-        'specific_rate': specific_rate,
-        'O2_for_biomass': O2_for_biomass,
-        'O2_for_product': O2_for_product,
-        'O2_for_waste': O2_for_waste,
-        'cumulative_O2': cumulative_O2,
-        'max_OTR': max_OTR,
-        'max_kla': max_kla,
-        'max_cooling_rate': max_cooling_rate,
-        'ave_cooling_rate': ave_cooling_rate,
-        'overall_yield': titer / total_sugar,
-        'sugar_for_txl': sugar_for_txl,
-        'O2_for_txl': O2_for_txl,
-        't_points': t_points,
-        'biomass_curve': biomass_curve,
-        'product_curve': product_curve,
+        'logistic_prod_rate':   logistic_prod_rate,
+        'specific_rate':        specific_rate,
+        'O2_for_biomass':       O2_for_biomass,
+        'O2_for_product':       O2_for_product,
+        'O2_for_waste':         O2_for_waste,
+        'O2_for_overflow':      O2_for_overflow,
+        'cumulative_O2':        cumulative_O2,
+        'max_OTR':              max_OTR,
+        'max_kla':              max_kla,
+        'max_cooling_rate':     max_cooling_rate,
+        'ave_cooling_rate':     ave_cooling_rate,
+        'overall_yield':        titer / total_sugar,
+        'sugar_for_txl':        sugar_for_txl,
+        'O2_for_txl':           O2_for_txl,
+        't_points':             t_points,
+        'biomass_curve':        biomass_curve,
+        'product_curve':        product_curve,
+        'production_mode':      production_mode,
+        't_growth':             growth_time_hr if production_mode == 'stationary_phase' else ferm_time,
+        't_production':         (titer / rate)  if production_mode == 'stationary_phase' else ferm_time,
     }
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — OPEX
+# SECTION 3 — OPERATING COSTS (OPEX)
 # ════════════════════════════════════════════════════════════════════════════════
+#
+# Annual costs broken into three categories (Supplemental Materials §3, Lynch 2021):
+#
+#   Variable (scale with production volume):
+#     Glucose, ammonia, MgSO₄, media salts, CIP chemicals (NaOH + peracetic acid),
+#     water, compressed air, mass-transfer electricity, cooling water,
+#     steam for sterilisation, steam for biomass heat-kill, centrifugation.
+#
+#   Fixed (largely independent of production volume):
+#     Labour — scales with number of fermentation tanks (Davis et al. 2018).
+#     Other fixed costs — 3.7% of TCI (maintenance, insurance, overhead).
+#       NOTE: other_fixed_costs can only be added after CAPEX is known, so
+#       calculate_opex() must be called twice (two-pass approach):
+#         Pass 1: other_fixed_costs=0 → size equipment → calculate_capex()
+#         Pass 2: other_fixed_costs = 0.037 × TCI_total → final OPEX
+#
+#   DSP (downstream processing):
+#     Calculated from route-specific reference CAPEX scaled by annual broth throughput
+#     (power-law economy of scale). DSP OPEX = DSP_CAPEX × route opex_pct_capex.
+#     Routes and parameters are in DSP_ROUTE_LIBRARY; compute with calculate_dsp().
+#
+# Utility cost equations from Ulrich & Vasudevan (2006), scaled by CEPCI index.
 
 def calculate_plant_logistics(capacity_kta, annual_uptime, batches_on_spec,
                                tank_volume_L, turnaround_time, fermentation):
@@ -380,7 +738,7 @@ def calculate_plant_logistics(capacity_kta, annual_uptime, batches_on_spec,
     tank_working_vol        = tank_volume_L * WORKING_VOL_RATIO
 
     batch_cycle_time  = fermentation['ferm_time'] + turnaround_time
-    batches_per_tank  = annual_uptime_hr / batch_cycle_time
+    batches_per_tank  = math.floor(annual_uptime_hr / batch_cycle_time)
     n_tanks = math.ceil(
         annual_production_gross
         / (fermentation['titer'] * tank_working_vol * batches_per_tank)
@@ -535,7 +893,7 @@ def calculate_labour_cost(n_tanks):
 
 
 def calculate_opex(logistics, fermentation, chemistry,
-                   DSP_yield, DSP_OPEX_frac,
+                   dsp,
                    price_glucose_per_g, price_ammonia_per_g,
                    media_cost_per_kgCDW, price_NaOH_per_kg,
                    price_peracetic_per_L, price_mgso4_per_kg,
@@ -546,11 +904,14 @@ def calculate_opex(logistics, fermentation, chemistry,
     """
     Calculate total annual OPEX broken down by category ($/yr).
 
+    dsp : dict   Output from calculate_dsp(). Provides overall_yield (for raw
+                 material scaling) and dsp_opex (absolute DSP operating cost).
+
     Pass other_fixed_costs=0 on first call; update after CAPEX is known
-    (other_fixed = 3.7% of TIC).
+    (other_fixed = 3.7% of TCI).
     """
     rm   = calculate_raw_material_costs(
-               logistics, fermentation, chemistry, DSP_yield,
+               logistics, fermentation, chemistry, dsp['overall_yield'],
                price_glucose_per_g, price_ammonia_per_g,
                media_cost_per_kgCDW, price_NaOH_per_kg, price_peracetic_per_L,
                price_mgso4_per_kg)
@@ -564,8 +925,8 @@ def calculate_opex(logistics, fermentation, chemistry,
                  + util['cooling_water'] + util['sterilisation'] + util['heat_kill']
                  + util['centrifugation'] + labour + other_fixed_costs)
 
-    total_opex = ferm_opex / (1 - DSP_OPEX_frac)
-    DSP_opex   = DSP_OPEX_frac * total_opex
+    DSP_opex   = dsp['dsp_opex']
+    total_opex = ferm_opex + DSP_opex
 
     annual_production_g = logistics['annual_production_g']
     capacity_kg         = annual_production_g / 1000
@@ -600,8 +961,23 @@ def calculate_opex(logistics, fermentation, chemistry,
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — CAPEX
+# SECTION 4 — CAPITAL COSTS (CAPEX)
 # ════════════════════════════════════════════════════════════════════════════════
+#
+# Factored cost estimation (Supplemental Materials §4, Lynch 2021):
+#
+#   TIC = Inflation_Factor × QuotedCost × (ActualSize / QuotedSize)^ScalingExp
+#         × InstallationFactor                              (Equations S4.1–S4.2)
+#
+# Equipment quoted costs, scaling exponents, and installation factors from
+# Table S4.1, Lynch 2021 (originally Davis et al. 2013/2018).
+#
+# Capital structure rollup (Table 1, Lynch 2021):
+#   TIC upstream
+#   + site development (9%) + warehouse (4%) + admin buildings (5%)  = TDC
+#   TDC + indirect costs (60% of TDC)                                = FCI
+#   FCI + working capital (5% of FCI)                                = TCI (upstream)
+#   TCI upstream + DSP_capex (from calculate_dsp())                   = TCI total
 
 # Equipment cost database — Table S4.1, Lynch 2021
 # Format: (quoted_cost $, quoted_size, scaling_exp, inflation_factor, install_factor)
@@ -622,7 +998,7 @@ EQUIP_DB = {
     'CIP_tank':       (98000,    10,     0.70, 1.13, 2.0),
     'CIP_pump':       (3900,     0.01,   0.80, 1.17, 2.3),
     'centrifuge':     (325000,   None,   None, 1.59, 1.8),
-    'broth_tank':     (1317000,  1000,   0.70, 1.00, 1.8),
+    'broth_tank':     (1317000,  1000,   0.70, 1.13, 1.8),
     'broth_pump':     (3900,     0.01,   0.80, 1.17, 2.3),
     'cooling_tower':  (1375000,  0.1,    0.60, 1.12, 1.5),
     'cooling_pump':   (283671,   0.1,    0.80, 1.12, 3.1),
@@ -733,10 +1109,12 @@ def size_equipment(logistics, fermentation, opex_results, tank_volume_L, ferm_te
     }
 
 
-def calculate_capex(sizing, DSP_CAPEX_frac):
+def calculate_capex(sizing, dsp):
     """
     Calculate total capital costs from equipment sizing.
     Implements Table 1 CAPEX rollup from Lynch 2021.
+
+    dsp : dict   Output from calculate_dsp(). Provides dsp_capex (absolute $).
     """
     n  = sizing['n_tanks']
     nc = sizing['n_centrifuges']
@@ -802,8 +1180,8 @@ def calculate_capex(sizing, DSP_CAPEX_frac):
     WC        = 0.05 * FCI
     TCI       = FCI + WC
 
-    TCI_total = TCI / (1 - DSP_CAPEX_frac)
-    DSP_capex = DSP_CAPEX_frac * TCI_total
+    DSP_capex = dsp['dsp_capex']
+    TCI_total = TCI + DSP_capex
 
     return {
         'area1': area1_total, 'area2': area2_total,
@@ -822,8 +1200,18 @@ def calculate_capex(sizing, DSP_CAPEX_frac):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — FINANCIALS
+# SECTION 5 — FINANCIAL OUTPUTS
 # ════════════════════════════════════════════════════════════════════════════════
+#
+# Plant timeline assumed by the model (Supplemental Materials §5, Lynch 2021):
+#   Years 1–2  Construction  (70% capex yr 1, 30% yr 2); interest payments only
+#   Year  3    Ramp-up       50% of nameplate capacity
+#   Year  4    Ramp-up       75% of nameplate capacity
+#   Year  5    Ramp-up       100% of nameplate capacity
+#   Years 6+   Full production at nameplate
+#
+# MSP is evaluated at nameplate capacity (first full-production year, yr 5).
+# DCF runs across the full user-specified payback period.
 
 def build_loan_schedule(principal, annual_rate, term_yr, n_years):
     """
@@ -849,6 +1237,15 @@ def build_loan_schedule(principal, annual_rate, term_yr, n_years):
     return interest_list, principal_list
 
 
+# MSP derivation — solving for the selling price that achieves the target margin.
+# Starting from:
+#   Margin = NI / Revenue
+#          = [(Revenue − OPEX − Depreciation − Maintenance − Interest) × (1−Tax)]
+#            / Revenue
+# Setting Margin = target and solving for Revenue:
+#   Revenue* = (OPEX + Depreciation + Maintenance + Interest) × (1−Tax)
+#              / [(1−Tax) − Margin]
+#   MSP = Revenue* / annual_capacity_kg
 def calculate_MSP(opex_total, capex, capacity_kg,
                   target_margin, tax_rate,
                   pct_debt, loan_interest, loan_term_yr,
@@ -886,6 +1283,11 @@ def calculate_MSP(opex_total, capex, capacity_kg,
     return MSP_revenue / capacity_kg
 
 
+# DCF net cash flow each year:
+#   NCF = Net Income + Depreciation − Principal repayment
+# Depreciation is added back (non-cash accounting charge; cash was spent at build).
+# Principal repayment is subtracted (real cash outflow not captured in P&L).
+# IRR is solved by bisection on NPV = 0.
 def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
                    tax_rate, discount_rate, payback_period,
                    pct_debt, loan_interest, loan_term_yr,

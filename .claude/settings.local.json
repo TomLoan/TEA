@@ -8,7 +8,9 @@
       "Bash(python patch_stage3.py)",
       "Bash(python patch_stage4.py)",
       "Bash(python patch_stage5.py)",
-      "Bash(python patch_verify.py)"
+      "Bash(python patch_verify.py)",
+      "Bash(python -c \"import tea_functions; print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('tea_functions.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
