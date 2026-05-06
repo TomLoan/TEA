@@ -1,4 +1,4 @@
-"""
+﻿"""
 tea_functions.py — Bioprocess TEA calculation functions.
 
 Implements the model described in:
@@ -25,9 +25,9 @@ NOT APPLICABLE TO
 
 KNOWN DISCREPANCIES vs LYNCH 2021 (all within ±50% FEL-1 tolerance)
 ---------------------------------------------------------------------
-- MaxOTR: equations in the supplementary give a value ~14× lower than Fig. 5b
-  (176.18 mmol/L/hr). Cannot be resolved from published equations alone —
-  likely reflects undescribed terms in the original JavaScript tool.
+- MaxOTR: original JavaScript uses biological µmax (not batch-fitted logistic rate)
+  plus separate overflow-oxidation and product-O₂ terms. This implementation now
+  matches that structure; µmax comes from organism presets (overridable).
   CUMULATIVE O₂ (which drives annual air and cooling costs) is unaffected.
 - OPEX: ~$1.32/kg vs paper $1.46/kg — gap from labour formula approximation
   and capital-linked fixed costs (Davis 2018 formula not fully published).
@@ -38,6 +38,7 @@ KNOWN DISCREPANCIES vs LYNCH 2021 (all within ±50% FEL-1 tolerance)
 import re
 import math
 import numpy as np
+from scipy.optimize import brentq
 
 # ── Atomic weights & molecular weights ──────────────────────────────────────
 ATOMIC_WEIGHTS = {'C': 12.011, 'H': 1.008, 'O': 15.999, 'N': 14.007, 'S': 32.06}
@@ -195,6 +196,7 @@ ORGANISM_PRESETS = {
     'Generic (model default)': {
         'biomass_yield_coeff':  BIOMASS_YIELD_COEFF,   # ~0.504 gCDW/g glucose
         'carbon_to_co2_frac':   0.0,
+        'mu_max':               0.40,   # h⁻¹ — conservative average
         'media_cost':           0.40,
         'note': 'Battley 1987 empirical average (C₃.₈₅H₆.₆₉O₁.₇₈N). '
                 'Reasonable for E. coli, B. subtilis on glucose.',
@@ -202,6 +204,7 @@ ORGANISM_PRESETS = {
     'E. coli (aerobic)': {
         'biomass_yield_coeff':  0.48,
         'carbon_to_co2_frac':   0.20,   # acetate overflow at high mu
+        'mu_max':               0.70,   # h⁻¹ — well-established aerobic fed-batch value
         'media_cost':           0.25,
         'note': 'Simple mineral salts medium; aerobic growth on glucose. '
                 '~20% of non-product glucose lost to acetate overflow even aerobically.',
@@ -209,6 +212,7 @@ ORGANISM_PRESETS = {
     'S. cerevisiae (yeast)': {
         'biomass_yield_coeff':  0.45,
         'carbon_to_co2_frac':   0.35,   # Crabtree effect — ethanol above ~0.1 g/L/hr glucose
+        'mu_max':               0.20,   # h⁻¹ — aerobic, glucose-limited chemostat
         'media_cost':           0.40,
         'note': 'Aerobic; mineral medium. Crabtree effect produces ethanol '
                 'above ~0.1 g/L/hr glucose — ~35% of non-product glucose diverted to CO₂/ethanol.',
@@ -216,17 +220,26 @@ ORGANISM_PRESETS = {
     'Pichia pastoris (methanol)': {
         'biomass_yield_coeff':  0.35,   # gCDW/g methanol (literature: 0.3–0.5)
         'carbon_to_co2_frac':   0.05,   # Crabtree-negative; minimal overflow on methanol
+        'mu_max':               0.05,   # h⁻¹ — methanol is a slow substrate; typical 0.03–0.08 h⁻¹
         'media_cost':           0.50,   # $/kgCDW — trace salts, biotin, more complex than E. coli
-        'note': 'Methylotrophic yeast widely used for secreted recombinant proteins. '
-                'Crabtree-negative (no ethanol overflow on methanol). '
-                'Select "Methanol" as carbon source to use methanol feedstock pricing. '
-                'Stoichiometry uses a glucose-equivalent approximation (carbon content per gram '
-                'differs by <7%) — suitable for FEL-1 (±50%) estimates. '
-                'Typical: 1–20 g/L secreted protein; 0.05–0.5 g/L/hr productivity.',
+        'note': (
+            'Methylotrophic yeast widely used for secreted recombinant proteins. '
+            'Crabtree-negative; slow growth on methanol (mu_max ~0.05/hr). '
+            'Select "Methanol" as carbon source to use methanol feedstock pricing. '
+            'IMPORTANT: in growth-associated mode, max OTR appears low because minimal '
+            'biomass accumulates when product yield is high. For realistic Pichia OTR, '
+            'use Stationary phase production mode and set target biomass '
+            '(typically 10-50 g CDW/L); the oxygen-intensive methanol induction phase '
+            'is then driven by that biomass density. '
+            'Stoichiometry uses a glucose-equivalent approximation '
+            '-- suitable for FEL-1 (+-50%) estimates. '
+            'Typical: 1-20 g/L secreted protein; 0.05-0.5 g/L/hr productivity.'
+        ),
     },
     'B. subtilis': {
         'biomass_yield_coeff':  0.50,
         'carbon_to_co2_frac':   0.10,   # minor acetoin/acetate overflow
+        'mu_max':               0.55,   # h⁻¹ — aerobic on glucose; literature 0.4–0.6 h⁻¹
         'media_cost':           0.30,
         'note': 'Aerobic; simple mineral medium. Relatively efficient — '
                 'minor acetoin/acetate overflow (~10% of non-product glucose).',
@@ -234,6 +247,7 @@ ORGANISM_PRESETS = {
     'Mammalian (CHO-like)': {
         'biomass_yield_coeff':  0.20,
         'carbon_to_co2_frac':   0.50,   # Warburg-like lactate + high ATP maintenance
+        'mu_max':               0.04,   # h⁻¹ — ~17 hr doubling time, typical for CHO
         'media_cost':           5.00,
         'note': 'Very rough approximation only. Complex medium required; '
                 'high media cost. Warburg-like lactate production + high maintenance '
@@ -309,20 +323,21 @@ def calculate_molecular_weight(a, b, c, d, e=0):
             ATOMIC_WEIGHTS['S'] * e)
 
 
-# H₂:CO₂ ratio for CₐHᵦOᵧNδSε (Equation 3, Lynch 2021):
-#   ratio = 0.5(b/a) − 1.0(c/a) − 1.5(d/a) + 3.0(e/a) + 2.0
-# The +3(e/a) S term is an extension of the original: SO₄²⁻ (S at +6) is
-# reduced to organic S (S at −2), consuming 8 electrons per atom, but the
-# net coefficient is +3 after accounting for the O and H that H₂SO₄ itself
-# contributes to the atom balance (not +4 as a naive electron count suggests).
+# H₂:CO₂ molar ratio for product CₐHᵦOᵧNδSε.
+# Derived from the degree-of-reduction (DoR) framework of Roels (1980):
+#   γ = 4a + b − 2c − 3d + 6e  (oxidation states C=+4, H=+1, O=−2, N=−3, S=−2)
+#   ratio = γ / (2a) = 2 + 0.5(b/a) − (c/a) − 1.5(d/a) + 3(e/a)
+# This matches Equation 3 of Lynch (2021) and extends it to sulfur-containing
+# products. The +3(e/a) coefficient is NOT from Lynch 2021; derived here from
+# first principles (Roels 1980) and independently validated:
+#   Cysteine   C₃H₇NO₂S:  γ=18, ratio=3.0; 3 glc + 4 NH₃ + 4 H₂SO₄ → 4 Cys + 6 CO₂ + 14 H₂O (balanced)
+#   Methionine C₅H₁₁NO₂S: γ=30, ratio=3.0; 5 glc + 4 NH₃ + 4 H₂SO₄ → 4 Met + 10 CO₂ + 18 H₂O (balanced)
+# Reference: Roels, J.A. (1980) Biotechnol. Bioeng. 22(12):2457–2514.
 def calculate_h2_co2_ratio(a, b, c, d, e=0):
     """
-    H2:CO2 ratio for product CaHbOcNdSe.
-    >2 = more reduced than glucose; =2 = neutral; <2 = more oxidised.
-    +3*(e/a) accounts for the redox cost of sulfate reduction to organic S
-    (8 electrons per S, but the coefficient is 3 after accounting for O/H
-    contributed by H2SO4 to the atom balance).
-    From Equation 3, Lynch 2021 (extended for S).
+    H₂:CO₂ molar ratio for product CₐHᵦOᵧNδSε using Roels (1980) degree of reduction.
+    >2: more reduced than glucose; =2: same as glucose; <2: more oxidised.
+    S extension (+3e/a) derived from DoR; validated against cysteine and methionine.
     """
     return 0.5*(b/a) - 1.0*(c/a) - 1.5*(d/a) + 3.0*(e/a) + 2.0
 
@@ -477,17 +492,19 @@ def run_chemistry(formula_str, is_protein=False,
 #       0.84 glucose + NH₃ + 1.212 O₂ → 1 biomass + 3.212 H₂O + 1.212 CO₂
 #     Biomass empirical formula: C₃.₈₅H₆.₆₉O₁.₇₈N (Battley 1987), MW = 95.37 g/mol
 #
-#   NOTE — MaxOTR discrepancy: the published supplementary equations give a
-#   MaxOTR ~14× lower than Fig. 5b (176.18 mmol/L/hr). This cannot be resolved
-#   from the paper alone and likely reflects undescribed terms in the original
-#   JavaScript. CUMULATIVE O₂ (which drives annual air and cooling costs) is
-#   unaffected and matches the paper's cost outputs.
+#   NOTE — MaxOTR: the original JavaScript tool uses three terms — biomass O₂,
+#   overflow/byproduct O₂, and product O₂ — all evaluated at biological µmax/4×X.
+#   This implementation follows that structure. µmax is taken from the organism
+#   preset (overridable in app.py); the batch-fitted logistic rate is used only
+#   for the time-course shape, not for peak O₂. CUMULATIVE O₂ (cost driver) is
+#   unaffected by the µmax choice.
 #
 #   Heat generation: 0.460 kJ per mmol O₂ consumed (Doran 1995). (Eq. S3.22)
 
 def run_fermentation_model(titer, rate, yield_fraction, chemistry,
                             biomass_yield_coeff=None, biomass_o2_coeff=None,
                             carbon_to_co2_frac=0.0,
+                            mu_max=0.40,
                             production_mode='growth_associated',
                             target_biomass=None, growth_time_hr=None):
     """
@@ -581,14 +598,18 @@ def run_fermentation_model(titer, rate, yield_fraction, chemistry,
         O2_for_txl        = sugar_for_txl    * 6000.0 / MW_GLUCOSE
         cumulative_O2     = O2_for_biomass + O2_for_product + O2_for_waste + O2_for_overflow + O2_for_txl
 
-        # max_OTR: growth phase peaks at N=K/2; stationary OTR from product formation (Case 3)
-        max_OTR_biomass    = ((1.0 / _biomass_o2) * (1000.0 / MW_O2)
-                               * (logistic_growth_rate / 4.0) * target_biomass)
+        # max_OTR: peak is the larger of (a) growth phase peak, (b) stationary production peak
+        # JS formula: (1/Ybo)/Ybf + (1/Yby)/(1-Ybf) where Ybf=biomass yield, Yby=glucose/O2 combustion
+        _peak_growth_sp   = mu_max / 4.0 * target_biomass
+        _byproduct_o2_sp  = MW_GLUCOSE / (6.0 * MW_O2)
+        max_OTR_biomass   = (1.0 / _biomass_o2) / _biomass_yield * (1000.0 / MW_O2) * _peak_growth_sp
+        max_OTR_byproduct = (1.0 / _byproduct_o2_sp) / (1.0 - _biomass_yield) * (1000.0 / MW_O2) * _peak_growth_sp
+        max_OTR_growth    = max_OTR_biomass + max_OTR_byproduct
         if eq['case'] == 3 and O2_for_product > 0:
             max_OTR_stationary = (rate / chemistry['yield_coeffs']['O2']) * (1000.0 / MW_O2)
         else:
             max_OTR_stationary = 0.0
-        max_OTR = max(max_OTR_biomass, max_OTR_stationary)
+        max_OTR = max(max_OTR_growth, max_OTR_stationary)
 
         # Time-course: two concatenated phases proportional to their durations
         n_growth = max(2, int(150 * growth_time_hr / ferm_time))
@@ -629,16 +650,20 @@ def run_fermentation_model(titer, rate, yield_fraction, chemistry,
         O2_for_txl        = sugar_for_txl    * 6000.0 / MW_GLUCOSE
         cumulative_O2     = O2_for_biomass + O2_for_product + O2_for_waste + O2_for_overflow + O2_for_txl
 
-        max_OTR_biomass = ((1.0 / _biomass_o2) * (1000.0 / MW_O2)
-                           * (logistic_growth_rate / 4.0) * final_biomass)
+        # Peak growth rate = µmax × X / 4 (logistic inflection point)
+        # JS formula (Lynch 2021): biomass term = (1/Ybo)/Ybf, byproduct term = (1/Yby)/(1-Ybf)
+        # where Ybf = biomass yield on glucose, Yby = g glucose per g O2 (complete combustion)
+        _peak_growth  = mu_max / 4.0 * final_biomass
+        _byproduct_o2 = MW_GLUCOSE / (6.0 * MW_O2)
+        max_OTR_biomass   = (1.0 / _biomass_o2) / _biomass_yield * (1000.0 / MW_O2) * _peak_growth
+        max_OTR_byproduct = (1.0 / _byproduct_o2) / (1.0 - _biomass_yield) * (1000.0 / MW_O2) * _peak_growth
         if eq['case'] == 3 and O2_for_product > 0:
-            max_product_rate = (product_to_cell_ratio * logistic_growth_rate
-                                * final_biomass / 4.0)
-            max_OTR_product  = ((1.0 / chemistry['yield_coeffs']['O2'])
-                                * (1000.0 / MW_O2) * max_product_rate)
+            max_OTR_product = ((1.0 / chemistry['yield_coeffs']['O2'])
+                               * (1000.0 / MW_O2)
+                               * product_to_cell_ratio * mu_max * final_biomass / 4.0)
         else:
             max_OTR_product = 0.0
-        max_OTR = max_OTR_biomass + max_OTR_product
+        max_OTR = max_OTR_biomass + max_OTR_byproduct + max_OTR_product
 
         t_points      = np.linspace(0, ferm_time, 300)
         biomass_curve = final_biomass / (1.0 + A * np.exp(-logistic_growth_rate * t_points))
@@ -765,7 +790,7 @@ def calculate_plant_logistics(capacity_kta, annual_uptime, batches_on_spec,
 
 
 def calculate_raw_material_costs(logistics, fermentation, chemistry,
-                                  DSP_yield, price_glucose_per_g,
+                                  DSP_yield, price_feedstock_per_g,
                                   price_ammonia_per_g, media_cost_per_kgCDW,
                                   price_NaOH_per_kg, price_peracetic_per_L,
                                   price_mgso4_per_kg=0.0):
@@ -777,7 +802,7 @@ def calculate_raw_material_costs(logistics, fermentation, chemistry,
     tank_working_vol     = logistics['tank_working_vol']
 
     glucose_per_g_product = 1.0 / (fermentation['overall_yield'] * DSP_yield)
-    cost_glucose = annual_production_g * glucose_per_g_product * price_glucose_per_g
+    cost_feedstock = annual_production_g * glucose_per_g_product * price_feedstock_per_g
 
     d = chemistry['atoms']['N']
     if d > 0 and chemistry['yield_coeffs']['NH3'] is not None:
@@ -802,7 +827,7 @@ def calculate_raw_material_costs(logistics, fermentation, chemistry,
                                 + peracetic_per_batch_L * price_peracetic_per_L)
 
     return {
-        'glucose': cost_glucose,
+        'feedstock': cost_feedstock,
         'ammonia': cost_ammonia,
         'sulfate': cost_sulfate,
         'media':   cost_media,
@@ -894,7 +919,7 @@ def calculate_labour_cost(n_tanks):
 
 def calculate_opex(logistics, fermentation, chemistry,
                    dsp,
-                   price_glucose_per_g, price_ammonia_per_g,
+                   price_feedstock_per_g, price_ammonia_per_g,
                    media_cost_per_kgCDW, price_NaOH_per_kg,
                    price_peracetic_per_L, price_mgso4_per_kg,
                    price_electricity,
@@ -912,7 +937,7 @@ def calculate_opex(logistics, fermentation, chemistry,
     """
     rm   = calculate_raw_material_costs(
                logistics, fermentation, chemistry, dsp['overall_yield'],
-               price_glucose_per_g, price_ammonia_per_g,
+               price_feedstock_per_g, price_ammonia_per_g,
                media_cost_per_kgCDW, price_NaOH_per_kg, price_peracetic_per_L,
                price_mgso4_per_kg)
     util = calculate_utility_costs(
@@ -920,7 +945,7 @@ def calculate_opex(logistics, fermentation, chemistry,
                price_electricity, price_natural_gas, CEPCI, cost_of_fuel)
     labour = calculate_labour_cost(logistics['n_tanks'])
 
-    ferm_opex = (rm['glucose'] + rm['ammonia'] + rm['sulfate'] + rm['media'] + rm['CIP']
+    ferm_opex = (rm['feedstock'] + rm['ammonia'] + rm['sulfate'] + rm['media'] + rm['CIP']
                  + util['water'] + util['compressed_air'] + util['mass_transfer']
                  + util['cooling_water'] + util['sterilisation'] + util['heat_kill']
                  + util['centrifugation'] + labour + other_fixed_costs)
@@ -932,7 +957,7 @@ def calculate_opex(logistics, fermentation, chemistry,
     capacity_kg         = annual_production_g / 1000
 
     return {
-        'glucose':         rm['glucose'],
+        'feedstock':       rm['feedstock'],
         'ammonia':         rm['ammonia'],
         'sulfate':         rm['sulfate'],
         'media':           rm['media'],
@@ -1346,10 +1371,11 @@ def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
 
     try:
         lo, hi = -0.9999, 10.0
-        for _ in range(400):
-            mid = (lo + hi) / 2
-            (lo := mid) if npv_at(mid) > 0 else (hi := mid)
-        IRR = (lo + hi) / 2
+        npv_lo, npv_hi = npv_at(lo), npv_at(hi)
+        if npv_lo * npv_hi < 0:
+            IRR = brentq(npv_at, lo, hi, xtol=1e-8, maxiter=200)
+        else:
+            IRR = float('nan')
     except Exception:
         IRR = float('nan')
 
@@ -1373,3 +1399,5 @@ def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
         'total_yrs':     total_yrs,
         'construction_yr': construction_yr,
     }
+
+

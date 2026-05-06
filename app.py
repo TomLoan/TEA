@@ -1,4 +1,4 @@
-"""
+﻿"""
 app.py — Streamlit TEA calculator
 Run with: streamlit run app.py
 """
@@ -7,6 +7,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import math
 import numpy as np
 
 from tea_functions import (
@@ -82,6 +83,15 @@ with st.sidebar:
                  "E. coli (glucose): ~0.48. S. cerevisiae (glucose): ~0.45. "
                  "Pichia pastoris (methanol): ~0.35. Mammalian: ~0.20. "
                  "Override the preset if you have measured data."
+        )
+        mu_max_override = st.number_input(
+            "µmax (h⁻¹)",
+            value=float(_org['mu_max']),
+            min_value=0.001, max_value=5.0, step=0.01, format="%.3f",
+            help="Biological maximum specific growth rate. Used only to estimate "
+                 "peak oxygen demand (Max OTR / kLa) — does not affect costs. "
+                 "E. coli: ~0.70. S. cerevisiae: ~0.20. Pichia (methanol): ~0.05. "
+                 "CHO: ~0.04. Override if you have measured µmax data."
         )
         carbon_to_co2_override = st.slider(
             "Carbon to CO₂/heat (%)",
@@ -293,7 +303,7 @@ cost_of_fuel = price_natural_gas / 1.05505
 capacity_kg = capacity_kta * 1e6
 
 OPEX_KWARGS = dict(
-    price_glucose_per_g=price_carbon_per_g,
+    price_feedstock_per_g=price_carbon_per_g,
     price_ammonia_per_g=price_ammonia_per_g,
     media_cost_per_kgCDW=media_cost_per_kgCDW,
     price_NaOH_per_kg=price_NaOH_per_kg,
@@ -320,6 +330,7 @@ try:
         titer, rate, yield_fraction, chem,
         biomass_yield_coeff=biomass_yield_override,
         carbon_to_co2_frac=carbon_to_co2_override,
+        mu_max=mu_max_override,
         production_mode='stationary_phase' if is_stationary else 'growth_associated',
         target_biomass=target_biomass_input if is_stationary else None,
         growth_time_hr=growth_time_input    if is_stationary else None,
@@ -392,11 +403,18 @@ mcol1.metric("MSP", f"${MSP:.2f}/kg",
          "target profit margin, assuming full nameplate production. The primary output for "
          "R&D goal-setting: if the current MSP exceeds your market price target, use the "
          "Sensitivity tab to identify which parameters to improve.")
-mcol2.metric("IRR", f"{dcf['IRR']:.1f}%",
+_irr = dcf['IRR']
+_irr_str = f"{_irr:.1f}%" if math.isfinite(_irr) else "N/A"
+mcol2.metric("IRR", _irr_str,
     help="Internal Rate of Return — the annualised return on invested capital over the "
          "payback period. Compared against the hurdle rate (discount rate): IRR > hurdle "
          "rate means the project creates value. Does not depend on selling price — it is "
-         "evaluated at the MSP.")
+         "evaluated at the MSP. Shows N/A when cash flows are monotonically negative "
+         "(no IRR exists — project does not break even within the bracket -100% to 1000%).")
+if not math.isfinite(_irr):
+    st.warning("IRR could not be computed: project cash flows do not change sign over the "
+               "search range. The project likely does not break even at these inputs. "
+               "Check titer, selling price, and scale.")
 mcol3.metric("NPV (20-yr)", f"${dcf['NPV']/1e6:.1f}M",
     help="Net Present Value over the payback period, discounted at the hurdle rate. Positive "
          "NPV = the project returns more than the cost of capital. Calculated at the user-set "
@@ -514,14 +532,18 @@ with tab_ferm:
 
     fcol5, fcol6, fcol7, fcol8 = st.columns(4)
     fcol5.metric("Max OTR", f"{ferm['max_OTR']:.2f} mmol/L/hr",
-        help="Peak oxygen transfer rate at the logistic growth midpoint (mmol O₂/L/hr). "
-             "Display metric only — does not affect any cost calculation. Note: the published "
-             "equations yield a value ~14× below Lynch Fig. 5b, likely due to undescribed "
-             "terms in the original tool; cumulative O₂ (which drives costs) is unaffected.")
+        help="Peak oxygen transfer rate (mmol O₂/L/hr) at the logistic growth-phase inflection "
+             "point (µmax/4 × Xₜᵉʳʳʲ˳). Formula matches Lynch 2021 JS: biomass O₂ term scales with "
+             "1/biomass_yield; byproduct term uses complete glucose combustion O₂ demand. "
+             "Display metric only — does not affect any cost calculation. "
+             "NOTE for Pichia: max OTR is low in growth-associated mode because minimal biomass "
+             "accumulates at high product yields. Use Stationary phase mode with a realistic "
+             "target biomass for a meaningful Pichia OTR estimate.")
     fcol6.metric("Max kLa", f"{ferm['max_kla']:.4f} s⁻¹",
         help="Minimum volumetric mass-transfer coefficient the bioreactor must achieve to "
-             "supply oxygen at the growth peak (s⁻¹). Useful for bioreactor design scoping. "
-             "Display metric only — does not affect cost calculations.")
+             "supply oxygen at the growth peak (s⁻¹). Derived from Max OTR and a driving "
+             "force of 75% DO consumption at air saturation. Useful for bioreactor design "
+             "scoping. Display metric — does not affect cost calculations.")
     fcol7.metric("Max cooling", f"{ferm['max_cooling_rate']:.1f} kJ/L/hr",
         help="Peak heat removal rate at the logistic growth midpoint (kJ/L/hr), derived from "
              "max OTR × 0.46 kJ/mmol O₂ (Doran 1995). Display metric only — equipment and "
@@ -592,7 +614,7 @@ with tab_opex:
              "and other fixed costs), before adding DSP operating costs.")
 
     opex_items = [
-        ("Glucose",          opex['glucose']),
+        (carbon_source,      opex['feedstock']),
         ("Ammonia",          opex['ammonia']),
         ("Sulfate (MgSO4)",  opex['sulfate']),
         ("Media (salts)",    opex['media']),
@@ -722,9 +744,11 @@ with tab_fin:
     st.subheader("DCF Financial Analysis")
     fincol1, fincol2, fincol3, fincol4 = st.columns(4)
     fincol1.metric("MSP", f"${MSP:.2f}/kg")
-    fincol2.metric("IRR", f"{dcf['IRR']:.1f}%",
-                   delta=f"vs hurdle {discount_rate*100:.0f}%",
-                   delta_color="normal" if dcf['IRR'] > discount_rate * 100 else "inverse")
+    _irr2 = dcf['IRR']
+    _irr2_str = f"{_irr2:.1f}%" if math.isfinite(_irr2) else "N/A"
+    fincol2.metric("IRR", _irr2_str,
+                   delta=f"vs hurdle {discount_rate*100:.0f}%" if math.isfinite(_irr2) else None,
+                   delta_color="normal" if math.isfinite(_irr2) and _irr2 > discount_rate * 100 else "inverse")
     fincol3.metric("NPV (20-yr)", f"${dcf['NPV']/1e6:.1f}M",
                    delta_color="normal" if dcf['NPV'] > 0 else "inverse")
     fincol4.metric("ROI", f"{dcf['ROI']:.1f}%")
@@ -796,12 +820,13 @@ with tab_sens:
         _cs_per_kg     = ov.get('price_carbon_per_kg', price_carbon_per_kg)
         _cap_kta       = ov.get('capacity_kta',       capacity_kta)
         _cap_kg        = _cap_kta * 1e6
-        _opex_kw       = dict(OPEX_KWARGS, price_glucose_per_g=_cs_per_kg / 1000)
+        _opex_kw       = dict(OPEX_KWARGS, price_feedstock_per_g=_cs_per_kg / 1000)
         try:
             _ferm = run_fermentation_model(
                 _titer, _rate, _yield_frac, chem,
                 biomass_yield_coeff=biomass_yield_override,
                 carbon_to_co2_frac=_co2_frac,
+                mu_max=mu_max_override,
                 production_mode='stationary_phase' if is_stationary else 'growth_associated',
                 target_biomass=target_biomass_input if is_stationary else None,
                 growth_time_hr=growth_time_input    if is_stationary else None,

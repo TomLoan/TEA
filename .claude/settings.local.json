@@ -10,7 +10,14 @@
       "Bash(python patch_stage5.py)",
       "Bash(python patch_verify.py)",
       "Bash(python -c \"import tea_functions; print\\('OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('tea_functions.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('tea_functions.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "PowerShell($PWD.Path)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users厐772\\\\Desktop\\\\Code\\\\TEA\" -Name -Filter \"*functions*\")",
+      "PowerShell(python fix_sulfur_docs.py)",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('tea_functions.py', encoding='utf-8-sig'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "PowerShell(python -c \"from tea_functions import calculate_h2_co2_ratio; cys=calculate_h2_co2_ratio\\(3,7,2,1,1\\); met=calculate_h2_co2_ratio\\(5,11,2,1,1\\); print\\(f'Cysteine ratio: {cys}'\\); print\\(f'Methionine ratio: {met}'\\)\")",
+      "PowerShell(python fix_methanol.py)",
+      "PowerShell(python -c \"from tea_functions import DSP_ROUTE_LIBRARY; print\\(list\\(DSP_ROUTE_LIBRARY.keys\\(\\)\\)\\)\")"
     ]
   }
 }
