@@ -1,4 +1,4 @@
-﻿"""
+"""
 tea_functions.py — Bioprocess TEA calculation functions.
 
 Implements the model described in:

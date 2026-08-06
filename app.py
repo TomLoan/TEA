@@ -1,4 +1,4 @@
-﻿"""
+"""
 app.py — Streamlit TEA calculator
 Run with: streamlit run app.py
 """
@@ -453,6 +453,7 @@ GMP/regulatory costs · Multi-substrate media · Fed-batch feeding strategies.
 st.divider()
 
 # Tabs
+plt.close("all")   # clear any stale figures from an interrupted resize-rerun
 tab_chem, tab_ferm, tab_opex, tab_capex, tab_fin, tab_sens = st.tabs(
     ["Chemistry", "Fermentation", "OPEX", "CAPEX", "Financials", "Sensitivity"]
 )
@@ -507,7 +508,7 @@ with tab_chem:
     rows.append({"Species": "H₂O", "Role": "Product", "Moles": f"{eq['H2O']:.4f}"})
     if eq['CO2'] > 1e-9:
         rows.append({"Species": "CO₂", "Role": "Byproduct", "Moles": f"{eq['CO2']:.4f}"})
-    st.dataframe(rows, use_container_width=True)
+    st.dataframe(rows, width='stretch')
 
 # ── Fermentation tab ──────────────────────────────────────────────────────────
 with tab_ferm:
@@ -579,7 +580,7 @@ with tab_ferm:
     if ferm['sugar_for_txl'] > 0:
         sugar_rows.append({"Category": "→ Tx/tl energy (protein only)", "g/L": f"{ferm['sugar_for_txl']:.2f}"})
     sugar_rows.append({"Category": "TOTAL glucose consumed", "g/L": f"{ferm['total_sugar']:.2f}"})
-    st.dataframe(sugar_rows, use_container_width=True)
+    st.dataframe(sugar_rows, width='stretch')
 
     # Time course plot
     st.markdown("**Fermentation time course:**")
@@ -634,7 +635,7 @@ with tab_opex:
         {"Item": name, "$/yr": f"${cost:,.0f}", "$/kg": f"${cost/capacity_kg:.3f}"}
         for name, cost in opex_items if cost > 0
     ]
-    st.dataframe(opex_table, use_container_width=True)
+    st.dataframe(opex_table, width='stretch')
 
     # Bar chart
     labels = [r[0] for r in opex_items if r[1] > 0]
@@ -721,12 +722,12 @@ with tab_capex:
         st.markdown("**By area:**")
         area_table = [{"Area": name, "$M": f"${cost/1e6:.1f}M"}
                       for name, cost in capex_area_items]
-        st.dataframe(area_table, use_container_width=True)
+        st.dataframe(area_table, width='stretch')
     with kacol5:
         st.markdown("**Capital structure:**")
         struct_table = [{"Item": name, "$M": f"${cost/1e6:.1f}M"}
                         for name, cost in capex_struct_items]
-        st.dataframe(struct_table, use_container_width=True)
+        st.dataframe(struct_table, width='stretch')
 
     # Bar chart
     fig_capex, ax = plt.subplots(figsize=(7, 3))
@@ -766,7 +767,7 @@ with tab_fin:
             "Cash Flow ($M)": f"${dcf['cash_flows'][yr]/1e6:.2f}",
             "Cumulative ($M)": f"${dcf['cum_flows'][yr]/1e6:.2f}",
         })
-    st.dataframe(cf_table, use_container_width=True)
+    st.dataframe(cf_table, width='stretch')
 
     # Cumulative cash flow plot
     fig_dcf, ax = plt.subplots(figsize=(9, 4))
@@ -950,7 +951,7 @@ with tab_sens:
             "Swing ($/kg)":   f"${d['swing']:.2f}",
             f"To reach ${target_msp:.2f}/kg": target_str,
         })
-    st.dataframe(sens_rows, use_container_width=True)
+    st.dataframe(sens_rows, width='stretch')
 
     with st.expander("What does each parameter mean — and how can it be improved?"):
         st.caption(

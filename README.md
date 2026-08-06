@@ -40,6 +40,23 @@ streamlit run app.py
 | File | Purpose |
 |---|---|
 | `app.py` | Streamlit UI — run this |
-| `tea_functions.py` | All calculation functions (importable) |
-| `bioprocess_tea_calculator.ipynb` | Source notebook with full derivations and validation against Lynch 2021 |
+| `tea_functions.py` | All calculation functions (importable, no Streamlit dependency) |
+| `dryrun.py` | Headless smoke test — runs the full pipeline at default inputs |
 | `requirements.txt` | Python dependencies |
+
+Derivations and the sourcing of each constant are documented in the docstrings and
+section comments of `tea_functions.py`.
+
+---
+
+## Checking a change
+
+`dryrun.py` runs the whole calculation chain outside Streamlit and compares the
+headline outputs against a stored baseline:
+
+```bash
+python dryrun.py
+```
+
+It exits non-zero if a result moves by more than 0.1%. When a model change is
+*meant* to move the numbers, update the `EXPECTED` dict at the bottom of the file.
