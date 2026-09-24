@@ -1,0 +1,11 @@
+[server]
+# Don't let Streamlit open the browser itself - open the URL it prints instead
+# (Ctrl+click it in the VS Code terminal).
+#
+# Why: on Windows with the Microsoft Store build of Firefox as the default
+# browser, Streamlit's auto-open hands the URL to Firefox from inside the
+# server process. When Firefox is already running, that left the process
+# unable to load pyarrow's native library, and the server died with an access
+# violation on the first page load. Opening the URL from any other process
+# (the terminal, the browser itself) avoids it.
+headless = true

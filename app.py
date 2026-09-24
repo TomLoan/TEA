@@ -5,7 +5,8 @@ Run with: streamlit run app.py
 import streamlit as st
 import matplotlib
 matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure  # not pyplot: its "current figure" is global
+                                      # state shared by concurrent script runs
 import matplotlib.ticker as ticker
 import math
 import numpy as np
@@ -456,7 +457,6 @@ GMP/regulatory costs · Multi-substrate media · Fed-batch feeding strategies.
 st.divider()
 
 # Tabs
-plt.close("all")   # clear any stale figures from an interrupted resize-rerun
 tab_chem, tab_ferm, tab_opex, tab_capex, tab_fin, tab_sens = st.tabs(
     ["Chemistry", "Fermentation", "OPEX", "CAPEX", "Financials", "Sensitivity"]
 )
@@ -587,7 +587,8 @@ with tab_ferm:
 
     # Time course plot
     st.markdown("**Fermentation time course:**")
-    fig_ferm, ax1 = plt.subplots(figsize=(8, 4))
+    fig_ferm = Figure(figsize=(8, 4))
+    ax1 = fig_ferm.subplots()
     ax2 = ax1.twinx()
     ax1.plot(ferm['t_points'], ferm['biomass_curve'], 'b-', linewidth=2, label='Biomass (gCDW/L)')
     ax2.plot(ferm['t_points'], ferm['product_curve'], 'r--', linewidth=2, label=f'{formula} (g/L)')
@@ -599,9 +600,8 @@ with tab_ferm:
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-    plt.tight_layout()
+    fig_ferm.tight_layout()
     st.pyplot(fig_ferm)
-    plt.close(fig_ferm)
 
 # ── OPEX tab ──────────────────────────────────────────────────────────────────
 with tab_opex:
@@ -643,13 +643,13 @@ with tab_opex:
     # Bar chart
     labels = [r[0] for r in opex_items if r[1] > 0]
     values = [r[1]/1e6 for r in opex_items if r[1] > 0]
-    fig_opex, ax = plt.subplots(figsize=(8, 4))
+    fig_opex = Figure(figsize=(8, 4))
+    ax = fig_opex.subplots()
     ax.barh(labels, values, color='steelblue')
     ax.set_xlabel("$/yr (M)")
     ax.set_title("OPEX breakdown")
-    plt.tight_layout()
+    fig_opex.tight_layout()
     st.pyplot(fig_opex)
-    plt.close(fig_opex)
 
     st.divider()
     st.subheader("DSP Recovery Funnel")
@@ -673,7 +673,8 @@ with tab_opex:
     for _y in dsp['step_yields']:
         _cum.append(_cum[-1] * _y)
     _n_steps = len(dsp['step_names'])
-    fig_dsp, ax_dsp = plt.subplots(figsize=(7, max(2.2, _n_steps * 0.6 + 0.8)))
+    fig_dsp = Figure(figsize=(7, max(2.2, _n_steps * 0.6 + 0.8)))
+    ax_dsp = fig_dsp.subplots()
     _y_pos = list(range(_n_steps))
     _bars = ax_dsp.barh(_y_pos, [c * 100 for c in _cum[1:]], color='steelblue', height=0.5)
     ax_dsp.set_xlim(0, 105)
@@ -685,9 +686,8 @@ with tab_opex:
     for _bar, _val in zip(_bars, _cum[1:]):
         ax_dsp.text(_bar.get_width() + 0.5, _bar.get_y() + _bar.get_height() / 2,
                     f"{_val*100:.1f}%", va='center', fontsize=9)
-    plt.tight_layout()
+    fig_dsp.tight_layout()
     st.pyplot(fig_dsp)
-    plt.close(fig_dsp)
 
 # ── CAPEX tab ─────────────────────────────────────────────────────────────────
 with tab_capex:
@@ -736,15 +736,16 @@ with tab_capex:
         st.dataframe(struct_table, width='stretch')
 
     # Bar chart
-    fig_capex, ax = plt.subplots(figsize=(7, 3))
+    fig_capex = Figure(figsize=(7, 3))
+    ax = fig_capex.subplots()
     ax.bar([n for n, _ in capex_area_items],
            [v/1e6 for _, v in capex_area_items], color='darkorange')
     ax.set_ylabel("$M")
     ax.set_title("CAPEX by area")
-    plt.xticks(rotation=30, ha='right')
-    plt.tight_layout()
+    for _lbl in ax.get_xticklabels():
+        _lbl.set(rotation=30, ha='right')
+    fig_capex.tight_layout()
     st.pyplot(fig_capex)
-    plt.close(fig_capex)
 
 # ── Financials tab ────────────────────────────────────────────────────────────
 with tab_fin:
@@ -776,7 +777,8 @@ with tab_fin:
     st.dataframe(cf_table, width='stretch')
 
     # Cumulative cash flow plot
-    fig_dcf, ax = plt.subplots(figsize=(9, 4))
+    fig_dcf = Figure(figsize=(9, 4))
+    ax = fig_dcf.subplots()
     yr_labels = list(range(1, dcf['total_yrs'] + 1))
     cum = [v / 1e6 for v in dcf['cum_flows']]
     ax.bar(yr_labels, [v / 1e6 for v in dcf['cash_flows']],
@@ -791,9 +793,8 @@ with tab_fin:
     ax.set_title('Cash flow proforma')
     ax.legend()
     ax.yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, _: f'${x:.0f}M'))
-    plt.tight_layout()
+    fig_dcf.tight_layout()
     st.pyplot(fig_dcf)
-    plt.close(fig_dcf)
 
     # MSP vs selling price comparison
     if selling_price > 0:
@@ -914,7 +915,8 @@ with tab_sens:
 
     # ── Tornado plot ───────────────────────────────────────────────────────────
     baseline = MSP
-    fig_t, ax_t = plt.subplots(figsize=(9, max(3, len(tornado) * 0.65 + 1.2)))
+    fig_t = Figure(figsize=(9, max(3, len(tornado) * 0.65 + 1.2)))
+    ax_t = fig_t.subplots()
     for i, d in enumerate(tornado):
         # green bar: improvement region (best → baseline)
         ax_t.barh(i, d['msp_best'] - baseline, left=baseline,
@@ -932,9 +934,8 @@ with tab_sens:
     ax_t.set_xlabel('MSP ($/kg)')
     ax_t.set_title('Sensitivity tornado — one parameter at a time')
     ax_t.legend(loc='lower right')
-    plt.tight_layout()
+    fig_t.tight_layout()
     st.pyplot(fig_t)
-    plt.close(fig_t)
 
     st.caption(
         "Green = improvement from baseline; red = deterioration. "

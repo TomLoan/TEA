@@ -22,7 +22,8 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app opens automatically at `http://localhost:8501`.
+Then open `http://localhost:8501` in your browser (Ctrl+click the URL in the terminal).
+The app deliberately does not open the browser itself - see `.streamlit/config.toml`.
 
 If you use [uv](https://docs.astral.sh/uv/):
 
