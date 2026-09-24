@@ -17,12 +17,13 @@ from tea_functions import (
     calculate_MSP, calculate_DCF,
     DSP_ROUTE_LIBRARY, ORGANISM_PRESETS, CARBON_SOURCE_OPTIONS,
     RAMP_FRACTIONS, CAPEX_YR1_FRAC, CAPEX_YR2_FRAC,
-    ONGOING_CAPEX_FRAC, DEPRECIATION_YR,
+    ONGOING_CAPEX_FRAC, DEPRECIATION_YR, COST_BASIS_CEPCI,
 )
 
 st.set_page_config(page_title="Bioprocess TEA", layout="wide")
 st.title("Bioprocess Techno-Economic Analysis")
-st.caption("Based on Lynch 2021 FEL-1 model (±50% accuracy). All costs in 2020 USD.")
+st.caption("Based on Lynch 2021 FEL-1 model (±50% accuracy). USD; capital costs "
+           "at the CEPCI set in the sidebar.")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -248,11 +249,13 @@ with st.sidebar:
                                               "of fermentation media and biomass heat-kill. US industrial "
                                               "price: ~$2–6/MMBtu. Henry Hub spot price as of 2020: "
                                               "$2.03/MMBtu (Lynch 2021 default: $3.11/MMBtu).")
-    CEPCI = st.number_input("CEPCI", value=603, min_value=100, max_value=1500,
-                             help="Chemical Engineering Plant Cost Index — used to scale equipment "
-                                  "purchase costs to current year. 2020 = 603 (paper baseline). "
-                                  "2024 ≈ 800 (+33%). Update this to get current-dollar estimates. "
-                                  "Source: Chemical Engineering magazine.")
+    CEPCI = st.number_input("CEPCI", value=800, min_value=100, max_value=1500,
+                             help="Chemical Engineering Plant Cost Index - scales all equipment "
+                                  "and DSP capital costs (and utility cost correlations) from the "
+                                  "Lynch 2021 cost basis of 603 to the chosen year. Default 800 is "
+                                  "roughly the 2023-24 annual average (2022 peaked near 816). Set "
+                                  "603 to reproduce the paper's cost basis. Check Chemical "
+                                  "Engineering magazine for the latest value.")
 
     # Financial
     st.subheader("Financial Parameters")
@@ -347,18 +350,18 @@ try:
         st.warning(f"{logistics['n_tanks']} tanks required. Consider increasing titer, "
                    f"tank volume, or reducing capacity target.")
     if CEPCI < 700:
-        st.info(f"CEPCI = {CEPCI} (2020 baseline). Current value (2024) ≈ 800. "
-                "Equipment cost estimates may be understated by ~30%.")
+        st.info(f"CEPCI = {CEPCI}: capital costs are at a pre-2021 price level. The "
+                "2023-24 index is around 800, so CAPEX may be understated by ~30%.")
 
     # DSP: compute route CAPEX/OPEX (scales with broth throughput)
     annual_broth_m3 = logistics['annual_ferm_vol'] / 1000
     dsp = calculate_dsp(dsp_route_key, annual_broth_m3,
-                        step_yield_overrides=step_overrides)
+                        step_yield_overrides=step_overrides, CEPCI=CEPCI)
 
     # Two-pass OPEX (first pass without other_fixed to get CAPEX, then re-run)
     opex_pass1 = calculate_opex(logistics, ferm, chem, dsp=dsp, **OPEX_KWARGS)
     sizing = size_equipment(logistics, ferm, opex_pass1, tank_volume_L, ferm_temp_C)
-    capex = calculate_capex(sizing, dsp=dsp)
+    capex = calculate_capex(sizing, dsp=dsp, CEPCI=CEPCI)
     other_fixed = 0.037 * capex['TCI_total']
     opex = calculate_opex(logistics, ferm, chem, dsp=dsp,
                           other_fixed_costs=other_fixed, **OPEX_KWARGS)
@@ -701,6 +704,9 @@ with tab_capex:
         help="Capital intensity — total TCI divided by annual nameplate production. "
              "Useful for benchmarking against published process economics. Typical range: "
              "$1–10/kg for commodity bioprocesses; $50–500+/kg for therapeutics.")
+    st.caption(f"Capital costs at CEPCI {CEPCI:.0f} "
+               f"(x{capex['cost_index_ratio']:.2f} on the Lynch 2021 basis of "
+               f"{COST_BASIS_CEPCI:.0f}).")
 
     capex_area_items = [
         ("Area 1: Main fermentation",      capex['area1']),
@@ -821,7 +827,9 @@ with tab_sens:
         _cs_per_kg     = ov.get('price_carbon_per_kg', price_carbon_per_kg)
         _cap_kta       = ov.get('capacity_kta',       capacity_kta)
         _cap_kg        = _cap_kta * 1e6
-        _opex_kw       = dict(OPEX_KWARGS, price_feedstock_per_g=_cs_per_kg / 1000)
+        _cepci         = ov.get('CEPCI',              CEPCI)
+        _opex_kw       = dict(OPEX_KWARGS, price_feedstock_per_g=_cs_per_kg / 1000,
+                              CEPCI=_cepci)
         try:
             _ferm = run_fermentation_model(
                 _titer, _rate, _yield_frac, chem,
@@ -841,12 +849,14 @@ with tab_sens:
                 # scale all step yields proportionally to reach the target overall yield
                 _base = max(dsp['overall_yield'], 1e-9)
                 _scaled = [min(1.0, y * _dsp_yield_ov / _base) for y in dsp['step_yields']]
-                _dsp = calculate_dsp(dsp_route_key, _broth_m3, step_yield_overrides=_scaled)
+                _dsp = calculate_dsp(dsp_route_key, _broth_m3, step_yield_overrides=_scaled,
+                                     CEPCI=_cepci)
             else:
-                _dsp = calculate_dsp(dsp_route_key, _broth_m3, step_yield_overrides=step_overrides)
+                _dsp = calculate_dsp(dsp_route_key, _broth_m3, step_yield_overrides=step_overrides,
+                                     CEPCI=_cepci)
             _op1   = calculate_opex(_log, _ferm, chem, dsp=_dsp, **_opex_kw)
             _sz    = size_equipment(_log, _ferm, _op1, tank_volume_L, ferm_temp_C)
-            _cx    = calculate_capex(_sz, dsp=_dsp)
+            _cx    = calculate_capex(_sz, dsp=_dsp, CEPCI=_cepci)
             _op    = calculate_opex(_log, _ferm, chem, dsp=_dsp,
                          other_fixed_costs=0.037 * _cx['TCI_total'], **_opex_kw)
             _m     = calculate_MSP(_op['total_opex'], _cx, _cap_kg,
@@ -865,6 +875,7 @@ with tab_sens:
     def _gL(v):   return f"{v:.0f} g/L"
     def _gLhr(v): return f"{v:.1f} g/L/hr"
     def _kta(v):  return f"{v:.0f} kta"
+    def _idx(v):  return f"CEPCI {v:.0f}"
 
     _base_dsp_yield = dsp['overall_yield']
     sweep_defs = [
@@ -875,6 +886,7 @@ with tab_sens:
         ("Carbon overflow loss","carbon_to_co2_frac", 0.0,                                 min(0.80, carbon_to_co2_override + 0.30), _pct),
         (f"{carbon_source} price", "price_carbon_per_kg", price_carbon_per_kg * 0.5,       price_carbon_per_kg * 2.0,              _dol),
         ("Scale",            "capacity_kta",       max(0.5, capacity_kta * 0.5),           capacity_kta * 2.0,                     _kta),
+        ("Capital cost index", "CEPCI",            CEPCI * 0.85,                           CEPCI * 1.25,                           _idx),
     ]
 
     # ── Compute tornado ────────────────────────────────────────────────────────

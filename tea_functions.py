@@ -34,6 +34,9 @@ KNOWN DISCREPANCIES vs LYNCH 2021 (all within ±50% FEL-1 tolerance)
 - CAPEX: ~$2.67/kg vs paper $2.76/kg — within 4%.
 - IRR: ~10 percentage points higher throughout — consistent with slightly
   lower cost base; relative sensitivity to inputs is preserved.
+- The comparisons above were made at CEPCI = 603 and before CAPEX followed
+  CEPCI and before the financing fix (construction-period debt draws, WC
+  neither depreciated nor lost). Re-check against the paper before relying on them.
 """
 import re
 import math
@@ -65,10 +68,18 @@ ASPECT_RATIO        = 3.0     # fermenter height:diameter ratio
 O2_MOLES_PER_M3_AIR = 9.375  # mol O2 / m³ air at STP
 DO_UTILISATION      = 0.75    # fraction of O2 in sparged air that is consumed
 
+# -- Capital cost basis ------------------------------------------------------
+# EQUIP_DB (via its inflation factors) and DSP_ROUTE_LIBRARY capex_ref are in
+# dollars at this CEPCI, the Lynch 2021 cost basis. All capital costs are scaled
+# by CEPCI / COST_BASIS_CEPCI to the user's chosen index value.
+COST_BASIS_CEPCI = 603.0
+
 # ── DSP route library ─────────────────────────────────────────────────────────
 # Each route defines per-step yield fractions and cost correlations.
-# CAPEX scales with annual broth throughput via power law (6th-tenths rule).
-# OPEX = DSP_CAPEX × opex_pct_capex (covers utilities, consumables, labour).
+# CAPEX scales with annual broth throughput via power law (6th-tenths rule),
+# and with CEPCI from the COST_BASIS_CEPCI basis.
+# OPEX = DSP_CAPEX x opex_pct_capex (covers utilities, consumables, labour), so it
+# follows CEPCI too - a proxy for general cost inflation in those items.
 # Reference costs are order-of-magnitude estimates consistent with ±50% FEL-1.
 DSP_ROUTE_LIBRARY = {
     'minimal_processing': {
@@ -150,7 +161,7 @@ DSP_ROUTE_LIBRARY = {
 }
 
 
-def calculate_dsp(route_name, annual_broth_vol_m3, step_yield_overrides=None):
+def calculate_dsp(route_name, annual_broth_vol_m3, step_yield_overrides=None, *, CEPCI):
     """
     Calculate DSP yield, CAPEX, and OPEX for a given processing route.
 
@@ -162,6 +173,9 @@ def calculate_dsp(route_name, annual_broth_vol_m3, step_yield_overrides=None):
         Annual broth volume processed (m³/yr) — logistics['annual_ferm_vol'] / 1000.
     step_yield_overrides : list of float or None
         Per-step yield fractions (same length as route steps). None = use defaults.
+    CEPCI : float
+        Cost index to express CAPEX in (keyword-only, required so it cannot be
+        silently left at the basis value).
 
     Returns
     -------
@@ -179,7 +193,8 @@ def calculate_dsp(route_name, annual_broth_vol_m3, step_yield_overrides=None):
         overall_yield *= y
 
     dsp_capex = (route['capex_ref']
-                 * (annual_broth_vol_m3 / route['ref_vol_m3_yr']) ** route['scale_exp'])
+                 * (annual_broth_vol_m3 / route['ref_vol_m3_yr']) ** route['scale_exp']
+                 * CEPCI / COST_BASIS_CEPCI)
     dsp_opex  = dsp_capex * route['opex_pct_capex']
 
     return {
@@ -994,6 +1009,9 @@ def calculate_opex(logistics, fermentation, chemistry,
 #   TIC = Inflation_Factor × QuotedCost × (ActualSize / QuotedSize)^ScalingExp
 #         × InstallationFactor                              (Equations S4.1–S4.2)
 #
+# Inflation_Factor brings each quote to the COST_BASIS_CEPCI basis; calculate_capex
+# then scales by CEPCI / COST_BASIS_CEPCI to the user's chosen year.
+#
 # Equipment quoted costs, scaling exponents, and installation factors from
 # Table S4.1, Lynch 2021 (originally Davis et al. 2013/2018).
 #
@@ -1134,31 +1152,40 @@ def size_equipment(logistics, fermentation, opex_results, tank_volume_L, ferm_te
     }
 
 
-def calculate_capex(sizing, dsp):
+def calculate_capex(sizing, dsp, *, CEPCI):
     """
     Calculate total capital costs from equipment sizing.
     Implements Table 1 CAPEX rollup from Lynch 2021.
 
-    dsp : dict   Output from calculate_dsp(). Provides dsp_capex (absolute $).
+    dsp   : dict   Output from calculate_dsp(). Provides dsp_capex (absolute $,
+                   already at CEPCI).
+    CEPCI : float  Cost index to express CAPEX in. Equipment costs are scaled by
+                   CEPCI / COST_BASIS_CEPCI; every downstream factor (piping,
+                   site, indirect, WC) is a percentage, so it follows.
     """
+    cost_index_ratio = CEPCI / COST_BASIS_CEPCI
+
+    def tic(name, actual_size=None, n_units=1):
+        return equipment_TIC(name, actual_size, n_units) * cost_index_ratio
+
     n  = sizing['n_tanks']
     nc = sizing['n_centrifuges']
     pf = sizing['pump_flow_m3s']
 
-    a1_fermenters = equipment_TIC('fermenter', n_units=n)
-    a1_agitators  = equipment_TIC('agitator',  sizing['agitator_kW'], n_units=n)
-    a1_pumps      = equipment_TIC('main_pump', pf, n_units=n)
-    a1_feed       = (equipment_TIC('feed_tank', sizing['feed_vol_m3'],  n_units=n)
-                   + equipment_TIC('feed_pump', pf*0.02, n_units=n))
-    a1_base       = (equipment_TIC('base_tank', sizing['base_vol_m3'],  n_units=n)
-                   + equipment_TIC('base_pump', pf*0.005, n_units=n))
-    a1_acid       = (equipment_TIC('acid_tank', sizing['base_vol_m3'],  n_units=n)
-                   + equipment_TIC('acid_pump', pf*0.005, n_units=n))
-    a1_media      = (equipment_TIC('dry_chem')
-                   + equipment_TIC('media_prep', sizing['tank_total_vol_m3'])
-                   + equipment_TIC('media_pump', pf))
-    a1_CIP        = (equipment_TIC('CIP_tank', sizing['CIP_vol_m3'], n_units=3)
-                   + equipment_TIC('CIP_pump', pf*0.01, n_units=3))
+    a1_fermenters = tic('fermenter', n_units=n)
+    a1_agitators  = tic('agitator',  sizing['agitator_kW'], n_units=n)
+    a1_pumps      = tic('main_pump', pf, n_units=n)
+    a1_feed       = (tic('feed_tank', sizing['feed_vol_m3'],  n_units=n)
+                   + tic('feed_pump', pf*0.02, n_units=n))
+    a1_base       = (tic('base_tank', sizing['base_vol_m3'],  n_units=n)
+                   + tic('base_pump', pf*0.005, n_units=n))
+    a1_acid       = (tic('acid_tank', sizing['base_vol_m3'],  n_units=n)
+                   + tic('acid_pump', pf*0.005, n_units=n))
+    a1_media      = (tic('dry_chem')
+                   + tic('media_prep', sizing['tank_total_vol_m3'])
+                   + tic('media_pump', pf))
+    a1_CIP        = (tic('CIP_tank', sizing['CIP_vol_m3'], n_units=3)
+                   + tic('CIP_pump', pf*0.01, n_units=3))
 
     area1_equip  = (a1_fermenters + a1_agitators + a1_pumps
                     + a1_feed + a1_base + a1_acid + a1_media + a1_CIP)
@@ -1167,26 +1194,26 @@ def calculate_capex(sizing, dsp):
 
     area2_total = 0.27 * area1_total
 
-    area3_equip  = (equipment_TIC('centrifuge', n_units=nc)
-                  + equipment_TIC('broth_tank', sizing['broth_vol_m3'])
-                  + equipment_TIC('broth_pump', pf * nc))
+    area3_equip  = (tic('centrifuge', n_units=nc)
+                  + tic('broth_tank', sizing['broth_vol_m3'])
+                  + tic('broth_pump', pf * nc))
     area3_piping = 0.045 * area3_equip
     area3_total  = area3_equip + area3_piping
 
-    a4_cooling = (equipment_TIC('cooling_tower', sizing['ave_cool_m3s'])
-                + equipment_TIC('cooling_pump',  sizing['ave_cool_m3s']))
-    a4_steam   =  equipment_TIC('boiler', sizing['steam_lb_hr'])
-    a4_air     = (equipment_TIC('air_compressor', sizing['comp_kW'])
-                + equipment_TIC('air_receiver',   max(abs(sizing['receiver_m3']), 1))
-                + equipment_TIC('air_dryer',      sizing['ave_airflow_m3s']))
-    a4_water   = (equipment_TIC('water_tank',     sizing['water_4hr_m3'])
-                + equipment_TIC('water_softener', sizing['water_2hr_m3'])
-                + equipment_TIC('water_pump',     sizing['water_m3s'])
-                + equipment_TIC('potable_water'))
-    a4_ww      = (equipment_TIC('ww_tank', sizing['ww_vol_m3'])
-                + equipment_TIC('ww_pump', sizing['water_m3s'] * 0.1))
-    a4_HX      = (equipment_TIC('heat_exchanger', sizing['hx_steri_m2'])
-                + equipment_TIC('heat_exchanger', sizing['hx_heatkill_m2']))
+    a4_cooling = (tic('cooling_tower', sizing['ave_cool_m3s'])
+                + tic('cooling_pump',  sizing['ave_cool_m3s']))
+    a4_steam   =  tic('boiler', sizing['steam_lb_hr'])
+    a4_air     = (tic('air_compressor', sizing['comp_kW'])
+                + tic('air_receiver',   max(abs(sizing['receiver_m3']), 1))
+                + tic('air_dryer',      sizing['ave_airflow_m3s']))
+    a4_water   = (tic('water_tank',     sizing['water_4hr_m3'])
+                + tic('water_softener', sizing['water_2hr_m3'])
+                + tic('water_pump',     sizing['water_m3s'])
+                + tic('potable_water'))
+    a4_ww      = (tic('ww_tank', sizing['ww_vol_m3'])
+                + tic('ww_pump', sizing['water_m3s'] * 0.1))
+    a4_HX      = (tic('heat_exchanger', sizing['hx_steri_m2'])
+                + tic('heat_exchanger', sizing['hx_heatkill_m2']))
 
     area4_equip   = a4_cooling + a4_steam + a4_air + a4_water + a4_ww + a4_HX
     area4_piping  = 0.045 * area4_equip
@@ -1221,6 +1248,7 @@ def calculate_capex(sizing, dsp):
         'TCI': TCI, 'TCI_total': TCI_total,
         'comp_kW': sizing['comp_kW'],
         'steam_lb_hr': sizing['steam_lb_hr'],
+        'cost_index_ratio': cost_index_ratio,
     }
 
 
@@ -1238,19 +1266,39 @@ def calculate_capex(sizing, dsp):
 # MSP is evaluated at nameplate capacity (first full-production year, yr 5).
 # DCF runs across the full user-specified payback period.
 
-def build_loan_schedule(principal, annual_rate, term_yr, n_years):
+def construction_fracs(construction_yr, capex_yr1_frac=CAPEX_YR1_FRAC,
+                       capex_yr2_frac=CAPEX_YR2_FRAC):
+    """Fraction of capital spent in each construction year."""
+    return [capex_yr1_frac if yr == 0 else capex_yr2_frac
+            for yr in range(construction_yr)]
+
+
+def build_loan_schedule(principal, annual_rate, term_yr, n_years, draw_fracs=()):
     """
-    Year-by-year loan amortisation schedule (equal annual payments).
+    Year-by-year debt schedule.
+
+    Construction years (one per entry in draw_fracs): the loan is drawn in step
+    with capital spend, at the start of each year, and only interest on the
+    drawn balance is paid. Amortisation (equal annual payments over term_yr)
+    starts in the first operating year. With no draw_fracs the full principal
+    is drawn up front and amortised from year 0.
     Returns (interest_payments, principal_payments), each a list of length n_years.
     """
-    balance        = principal
-    annual_payment = (principal * annual_rate
-                      / (1 - (1 + annual_rate)**(-term_yr))
-                      if annual_rate > 0 else principal / term_yr)
-    interest_list  = []
-    principal_list = []
+    construction_yr = len(draw_fracs)
+    balance         = principal if construction_yr == 0 else 0.0
+    interest_list   = []
+    principal_list  = []
     for yr in range(n_years):
-        if balance > 0:
+        if yr < construction_yr:
+            balance += principal * draw_fracs[yr]
+            interest_list.append(balance * annual_rate)
+            principal_list.append(0.0)
+            continue
+        if yr == construction_yr:
+            annual_payment = (balance * annual_rate
+                              / (1 - (1 + annual_rate)**(-term_yr))
+                              if annual_rate > 0 else balance / term_yr)
+        if balance > 1e-9 * principal:   # tolerance: float residue after the last payment
             interest = balance * annual_rate
             princ    = min(annual_payment - interest, balance)
             balance  = max(balance - princ, 0.0)
@@ -1286,15 +1334,17 @@ def calculate_MSP(opex_total, capex, capacity_kg,
 
     TCI            = capex['TCI_total']
     debt_amount    = pct_debt * TCI
-    annual_deprec  = TCI / depreciation_yr
+    annual_deprec  = (TCI - capex['WC']) / depreciation_yr   # WC is not depreciable
     annual_ongoing = ongoing_capex_frac * TCI
 
-    ramp_yr       = len(ramp_fractions)
-    n_years_to_np = construction_yr + ramp_yr
-    total_yrs     = n_years_to_np + 1
+    # First year at 100% of nameplate (yr 5 with the default 50/75/100% ramp)
+    full_idx      = next((i for i, f in enumerate(ramp_fractions) if f >= 1.0),
+                         len(ramp_fractions))
+    n_years_to_np = construction_yr + full_idx
 
     interest_s, _ = build_loan_schedule(debt_amount, loan_interest,
-                                         loan_term_yr, total_yrs)
+                                         loan_term_yr, n_years_to_np + 1,
+                                         draw_fracs=construction_fracs(construction_yr))
     interest_at_nameplate = interest_s[n_years_to_np]
 
     numerator   = (opex_total + annual_deprec + annual_ongoing
@@ -1312,6 +1362,7 @@ def calculate_MSP(opex_total, capex, capacity_kg,
 #   NCF = Net Income + Depreciation − Principal repayment
 # Depreciation is added back (non-cash accounting charge; cash was spent at build).
 # Principal repayment is subtracted (real cash outflow not captured in P&L).
+# Depreciation excludes working capital, which is recovered in the final year.
 # IRR is solved by bisection on NPV = 0.
 def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
                    tax_rate, discount_rate, payback_period,
@@ -1326,13 +1377,14 @@ def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
     TCI            = capex['TCI_total']
     debt_amount    = pct_debt * TCI
     equity_amount  = (1 - pct_debt) * TCI
-    annual_deprec  = TCI / depreciation_yr
+    annual_deprec  = (TCI - capex['WC']) / depreciation_yr   # WC is not depreciable
     annual_ongoing = ongoing_capex_frac * TCI
     ramp_yr        = len(ramp_fractions)
     total_yrs      = construction_yr + payback_period
+    spend_fracs    = construction_fracs(construction_yr, capex_yr1_frac, capex_yr2_frac)
 
     interest_s, principal_s = build_loan_schedule(
-        debt_amount, loan_interest, loan_term_yr, total_yrs)
+        debt_amount, loan_interest, loan_term_yr, total_yrs, draw_fracs=spend_fracs)
 
     cash_flows  = []
     revenues    = []
@@ -1340,8 +1392,7 @@ def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
 
     for yr in range(total_yrs):
         if yr < construction_yr:
-            frac = capex_yr1_frac if yr == 0 else capex_yr2_frac
-            ncf  = -(frac * equity_amount + interest_s[yr])
+            ncf = -(spend_fracs[yr] * equity_amount + interest_s[yr])
             cash_flows.append(ncf)
             revenues.append(0)
             net_incomes.append(0)
@@ -1360,6 +1411,8 @@ def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
         NI    = EBT - tax
 
         ncf = NI + deprec - principal_s[yr]
+        if yr == total_yrs - 1:
+            ncf += capex['WC']   # working capital recovered at end of project
         cash_flows.append(ncf)
         revenues.append(revenue)
         net_incomes.append(NI)

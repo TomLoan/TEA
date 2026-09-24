@@ -68,7 +68,7 @@ price_peracetic_per_L= 5.00
 # Utility prices
 price_electricity    = 0.11
 price_natural_gas    = 3.11
-CEPCI                = 603
+CEPCI                = 800
 
 # Financial parameters
 selling_price    = 2.50
@@ -123,7 +123,7 @@ logistics = calculate_plant_logistics(capacity_kta, annual_uptime, batches_on_sp
 
 print("4. calculate_dsp...")
 dsp = calculate_dsp(dsp_route_key, logistics["annual_ferm_vol"] / 1000,
-                    step_yield_overrides=step_overrides)
+                    step_yield_overrides=step_overrides, CEPCI=CEPCI)
 
 print("5. calculate_opex pass 1...")
 opex1 = calculate_opex(logistics, ferm, chem, dsp=dsp, **OPEX_KWARGS)
@@ -132,7 +132,7 @@ print("6. size_equipment...")
 sizing = size_equipment(logistics, ferm, opex1, tank_volume_L, ferm_temp_C)
 
 print("7. calculate_capex...")
-capex = calculate_capex(sizing, dsp=dsp)
+capex = calculate_capex(sizing, dsp=dsp, CEPCI=CEPCI)
 
 print("8. calculate_opex pass 2...")
 opex = calculate_opex(logistics, ferm, chem, dsp=dsp,
@@ -178,11 +178,11 @@ plt.close(fig)
 # Update these deliberately when a model change is expected to move the numbers.
 print("13. Checking regression baseline...")
 EXPECTED = {
-    "MSP":         (MSP,                      3.0270),
-    "IRR":         (dcf["IRR"],              28.3346),
-    "NPV_M":       (dcf["NPV"] / 1e6,        11.9965),
-    "TCI_M":       (capex["TCI_total"] / 1e6, 42.4617),
-    "opex_per_kg": (opex["opex_per_kg"],      1.2305),
+    "MSP":         (MSP,                      3.6235),
+    "IRR":         (dcf["IRR"],              15.1314),
+    "NPV_M":       (dcf["NPV"] / 1e6,        -8.1888),
+    "TCI_M":       (capex["TCI_total"] / 1e6, 56.3340),
+    "opex_per_kg": (opex["opex_per_kg"],      1.3557),
     "n_tanks":     (logistics["n_tanks"],     2),
 }
 failures = []
