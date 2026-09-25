@@ -70,6 +70,11 @@ price_electricity    = 0.11
 price_natural_gas    = 3.11
 CEPCI                = 800
 
+# Capital cost basis
+location_factor       = 1.00
+years_to_construction = 0
+escalation_rate       = 0.005        # 0.5 %/yr above inflation
+
 # Financial parameters
 selling_price    = 2.50
 target_margin    = 0.30
@@ -132,7 +137,10 @@ print("6. size_equipment...")
 sizing = size_equipment(logistics, ferm, opex1, tank_volume_L, ferm_temp_C)
 
 print("7. calculate_capex...")
-capex = calculate_capex(sizing, dsp=dsp, CEPCI=CEPCI)
+capex = calculate_capex(sizing, dsp=dsp, CEPCI=CEPCI,
+                        location_factor=location_factor,
+                        escalation_rate=escalation_rate,
+                        years_to_construction=years_to_construction)
 
 print("8. calculate_opex pass 2...")
 opex = calculate_opex(logistics, ferm, chem, dsp=dsp,
@@ -178,11 +186,11 @@ plt.close(fig)
 # Update these deliberately when a model change is expected to move the numbers.
 print("13. Checking regression baseline...")
 EXPECTED = {
-    "MSP":         (MSP,                      3.6235),
-    "IRR":         (dcf["IRR"],              15.1314),
-    "NPV_M":       (dcf["NPV"] / 1e6,        -8.1888),
-    "TCI_M":       (capex["TCI_total"] / 1e6, 56.3340),
-    "opex_per_kg": (opex["opex_per_kg"],      1.3557),
+    "MSP":         (MSP,                      3.6301),
+    "IRR":         (dcf["IRR"],              14.9910),
+    "NPV_M":       (dcf["NPV"] / 1e6,        -8.4512),
+    "TCI_M":       (capex["TCI_total"] / 1e6, 56.5594),
+    "opex_per_kg": (opex["opex_per_kg"],      1.3562),
     "n_tanks":     (logistics["n_tanks"],     2),
 }
 failures = []

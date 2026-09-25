@@ -1020,7 +1020,13 @@ def calculate_opex(logistics, fermentation, chemistry,
 #   + site development (9%) + warehouse (4%) + admin buildings (5%)  = TDC
 #   TDC + indirect costs (60% of TDC)                                = FCI
 #   FCI + working capital (5% of FCI)                                = TCI (upstream)
-#   TCI upstream + DSP_capex (from calculate_dsp())                   = TCI total
+#   TCI upstream + DSP_capex (from calculate_dsp())                   = TCI basis
+#   TCI basis x location factor x escalation factor                  = TCI total
+#
+# TCI basis is a US Gulf Coast plant priced at the chosen CEPCI (i.e. as if paid
+# for on the estimate date). The location factor converts it to another site.
+# Escalation then grows each construction year's spend from the estimate date to
+# the middle of that year (see capital_escalation_factor).
 
 # Equipment cost database — Table S4.1, Lynch 2021
 # Format: (quoted_cost $, quoted_size, scaling_exp, inflation_factor, install_factor)
@@ -1152,16 +1158,43 @@ def size_equipment(logistics, fermentation, opex_results, tank_volume_L, ferm_te
     }
 
 
-def calculate_capex(sizing, dsp, *, CEPCI):
+def capital_escalation_factor(escalation_rate, years_to_construction, construction_yr=2):
+    """
+    Escalation to the midpoint of construction spend.
+
+    Each construction year's share of capital (construction_fracs) is treated as
+    spent halfway through that year and grown from the estimate date at
+    escalation_rate; the result is the spend-weighted multiplier on capital.
+    E.g. 3%/yr with construction starting in 2 years: 0.7 x 1.03^2.5 +
+    0.3 x 1.03^3.5 = 1.086.
+
+    The rest of the model is in estimate-date money (revenue and OPEX do not
+    inflate), so escalation_rate should be capital-cost growth ABOVE general
+    inflation, not nominal CEPCI growth.
+    """
+    return sum(frac * (1 + escalation_rate) ** (years_to_construction + yr + 0.5)
+               for yr, frac in enumerate(construction_fracs(construction_yr)))
+
+
+def calculate_capex(sizing, dsp, *, CEPCI, location_factor, escalation_rate,
+                    years_to_construction):
     """
     Calculate total capital costs from equipment sizing.
-    Implements Table 1 CAPEX rollup from Lynch 2021.
+    Implements Table 1 CAPEX rollup from Lynch 2021, then location and escalation.
 
     dsp   : dict   Output from calculate_dsp(). Provides dsp_capex (absolute $,
                    already at CEPCI).
     CEPCI : float  Cost index to express CAPEX in. Equipment costs are scaled by
                    CEPCI / COST_BASIS_CEPCI; every downstream factor (piping,
                    site, indirect, WC) is a percentage, so it follows.
+    location_factor       : float  Site cost relative to US Gulf Coast (1.0).
+    escalation_rate       : float  Capital cost growth above general inflation
+                                   (fraction per year).
+    years_to_construction : float  Years from the estimate date to the start of
+                                   construction.
+
+    All keyword arguments are required so none can be silently left at a
+    neutral value by one caller (the sensitivity tornado swallows exceptions).
     """
     cost_index_ratio = CEPCI / COST_BASIS_CEPCI
 
@@ -1233,7 +1266,13 @@ def calculate_capex(sizing, dsp, *, CEPCI):
     TCI       = FCI + WC
 
     DSP_capex = dsp['dsp_capex']
-    TCI_total = TCI + DSP_capex
+    TCI_basis = TCI + DSP_capex
+
+    escalation_factor = capital_escalation_factor(escalation_rate, years_to_construction)
+    location_adj = TCI_basis * (location_factor - 1.0)
+    escalation   = (TCI_basis + location_adj) * (escalation_factor - 1.0)
+    TCI_total    = TCI_basis + location_adj + escalation
+    WC_total     = WC * location_factor * escalation_factor   # WC's share of TCI_total
 
     return {
         'area1': area1_total, 'area2': area2_total,
@@ -1245,7 +1284,10 @@ def calculate_capex(sizing, dsp, *, CEPCI):
         'TIC_upstream': TIC_upstream, 'DSP_capex': DSP_capex,
         'TDC': TDC, 'indirect': indirect,
         'FCI': FCI, 'WC': WC,
-        'TCI': TCI, 'TCI_total': TCI_total,
+        'TCI': TCI, 'TCI_basis': TCI_basis, 'TCI_total': TCI_total,
+        'location_factor': location_factor, 'location_adj': location_adj,
+        'escalation_factor': escalation_factor, 'escalation': escalation,
+        'WC_total': WC_total,
         'comp_kW': sizing['comp_kW'],
         'steam_lb_hr': sizing['steam_lb_hr'],
         'cost_index_ratio': cost_index_ratio,
@@ -1334,7 +1376,7 @@ def calculate_MSP(opex_total, capex, capacity_kg,
 
     TCI            = capex['TCI_total']
     debt_amount    = pct_debt * TCI
-    annual_deprec  = (TCI - capex['WC']) / depreciation_yr   # WC is not depreciable
+    annual_deprec  = (TCI - capex['WC_total']) / depreciation_yr   # WC is not depreciable
     annual_ongoing = ongoing_capex_frac * TCI
 
     # First year at 100% of nameplate (yr 5 with the default 50/75/100% ramp)
@@ -1377,7 +1419,7 @@ def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
     TCI            = capex['TCI_total']
     debt_amount    = pct_debt * TCI
     equity_amount  = (1 - pct_debt) * TCI
-    annual_deprec  = (TCI - capex['WC']) / depreciation_yr   # WC is not depreciable
+    annual_deprec  = (TCI - capex['WC_total']) / depreciation_yr   # WC is not depreciable
     annual_ongoing = ongoing_capex_frac * TCI
     ramp_yr        = len(ramp_fractions)
     total_yrs      = construction_yr + payback_period
@@ -1412,7 +1454,7 @@ def calculate_DCF(opex_total, capex, capacity_kg, selling_price,
 
         ncf = NI + deprec - principal_s[yr]
         if yr == total_yrs - 1:
-            ncf += capex['WC']   # working capital recovered at end of project
+            ncf += capex['WC_total']   # working capital recovered at end of project
         cash_flows.append(ncf)
         revenues.append(revenue)
         net_incomes.append(NI)

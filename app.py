@@ -250,6 +250,9 @@ with st.sidebar:
                                               "of fermentation media and biomass heat-kill. US industrial "
                                               "price: ~$2–6/MMBtu. Henry Hub spot price as of 2020: "
                                               "$2.03/MMBtu (Lynch 2021 default: $3.11/MMBtu).")
+
+    # Capital cost basis
+    st.subheader("Capital Cost Basis")
     CEPCI = st.number_input("CEPCI", value=800, min_value=100, max_value=1500,
                              help="Chemical Engineering Plant Cost Index - scales all equipment "
                                   "and DSP capital costs (and utility cost correlations) from the "
@@ -257,6 +260,29 @@ with st.sidebar:
                                   "roughly the 2023-24 annual average (2022 peaked near 816). Set "
                                   "603 to reproduce the paper's cost basis. Check Chemical "
                                   "Engineering magazine for the latest value.")
+    location_factor = st.number_input(
+        "Location factor", value=1.00, min_value=0.5, max_value=2.0, step=0.05, format="%.2f",
+        help="Capital cost at your site relative to a US Gulf Coast plant (1.00), which is "
+             "the basis of the equipment costs. Captures local construction labour, "
+             "productivity, imported equipment and exchange rates. Published factors for "
+             "developed-country sites mostly fall between about 1.0 and 1.3 (Australia is "
+             "commonly quoted around 1.2) - check a current source such as Towler & Sinnott, "
+             "Chemical Engineering Design, as factors move with exchange rates. Applies to "
+             "capital only; set local utility, feedstock and labour prices separately.")
+    years_to_construction = st.number_input(
+        "Years until construction starts", value=0, min_value=0, max_value=20, step=1,
+        help="Time from today (the CEPCI date) until construction begins. Construction then "
+             "takes 2 years (70% of capital spent in year 1, 30% in year 2). Used only for "
+             "capital escalation.")
+    escalation_rate = st.number_input(
+        "Capital escalation above inflation (%/yr)", value=0.5, min_value=-5.0, max_value=15.0,
+        step=0.5, format="%.1f",
+        help="How much faster plant costs are expected to rise than prices in general. Each "
+             "construction year's spend is escalated from today to the middle of that year. "
+             "Enter growth ABOVE general inflation: revenue and OPEX in this model are in "
+             "today's money, so escalating capital by the full CEPCI trend would overstate it. "
+             "For reference, CEPCI rose roughly 0.5%/yr faster than US consumer prices over "
+             "2000-2024, but around 2-3%/yr faster over 2020-2024.") / 100.0
 
     # Financial
     st.subheader("Financial Parameters")
@@ -320,6 +346,11 @@ OPEX_KWARGS = dict(
     ferm_temp_C=ferm_temp_C,
     tank_volume_L=tank_volume_L,
 )
+CAPEX_KWARGS = dict(
+    location_factor=location_factor,
+    escalation_rate=escalation_rate,
+    years_to_construction=years_to_construction,
+)
 
 # ── Main calculation (no Run button — reactive) ───────────────────────────────
 try:
@@ -362,7 +393,7 @@ try:
     # Two-pass OPEX (first pass without other_fixed to get CAPEX, then re-run)
     opex_pass1 = calculate_opex(logistics, ferm, chem, dsp=dsp, **OPEX_KWARGS)
     sizing = size_equipment(logistics, ferm, opex_pass1, tank_volume_L, ferm_temp_C)
-    capex = calculate_capex(sizing, dsp=dsp, CEPCI=CEPCI)
+    capex = calculate_capex(sizing, dsp=dsp, CEPCI=CEPCI, **CAPEX_KWARGS)
     other_fixed = 0.037 * capex['TCI_total']
     opex = calculate_opex(logistics, ferm, chem, dsp=dsp,
                           other_fixed_costs=other_fixed, **OPEX_KWARGS)
@@ -696,17 +727,22 @@ with tab_capex:
     kacol1.metric("TCI (upstream)", f"${capex['TCI']/1e6:.1f}M",
         help="Total Capital Investment for the fermentation + utilities sections only "
              "(Areas 1–4): equipment, installation, site development, indirect costs "
-             "(engineering, contingency, startup), and working capital. Excludes DSP.")
+             "(engineering, contingency, startup), and working capital. Excludes DSP, "
+             "and is before the location and escalation adjustments.")
     kacol2.metric("TCI (incl. DSP)", f"${capex['TCI_total']/1e6:.1f}M",
-        help="Total Capital Investment including both fermentation and DSP sections. "
-             "This is the number used to calculate MSP, IRR, and NPV.")
+        help="Total Capital Investment including both fermentation and DSP sections, "
+             "adjusted for location and escalation. This is the number used to "
+             "calculate MSP, IRR, and NPV.")
     kacol3.metric("TCI per kg/yr", f"${capex['TCI_total']/capacity_kg:.2f}/kg",
         help="Capital intensity — total TCI divided by annual nameplate production. "
              "Useful for benchmarking against published process economics. Typical range: "
              "$1–10/kg for commodity bioprocesses; $50–500+/kg for therapeutics.")
     st.caption(f"Capital costs at CEPCI {CEPCI:.0f} "
                f"(x{capex['cost_index_ratio']:.2f} on the Lynch 2021 basis of "
-               f"{COST_BASIS_CEPCI:.0f}).")
+               f"{COST_BASIS_CEPCI:.0f}), location factor "
+               f"x{capex['location_factor']:.2f}, escalation "
+               f"x{capex['escalation_factor']:.3f} (construction starting in "
+               f"{years_to_construction} yr, {escalation_rate*100:.1f}%/yr above inflation).")
 
     capex_area_items = [
         ("Area 1: Main fermentation",      capex['area1']),
@@ -721,6 +757,9 @@ with tab_capex:
         ("Indirect costs",    capex['indirect']),
         ("Working capital",   capex['WC']),
         ("DSP capital",       capex['DSP_capex']),
+        ("Location adjustment", capex['location_adj']),
+        ("Escalation",        capex['escalation']),
+        ("Total (TCI)",       capex['TCI_total']),
     ]
 
     kacol4, kacol5 = st.columns(2)
@@ -857,7 +896,7 @@ with tab_sens:
                                      CEPCI=_cepci)
             _op1   = calculate_opex(_log, _ferm, chem, dsp=_dsp, **_opex_kw)
             _sz    = size_equipment(_log, _ferm, _op1, tank_volume_L, ferm_temp_C)
-            _cx    = calculate_capex(_sz, dsp=_dsp, CEPCI=_cepci)
+            _cx    = calculate_capex(_sz, dsp=_dsp, CEPCI=_cepci, **CAPEX_KWARGS)
             _op    = calculate_opex(_log, _ferm, chem, dsp=_dsp,
                          other_fixed_costs=0.037 * _cx['TCI_total'], **_opex_kw)
             _m     = calculate_MSP(_op['total_opex'], _cx, _cap_kg,
